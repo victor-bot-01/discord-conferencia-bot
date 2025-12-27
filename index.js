@@ -1,8 +1,9 @@
-require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
-const express = require('express');
+// index.js
+// Discord bot (discord.js v14) + Render/HTTP keep-alive
+// Comandos: /ping, /pedido
+// Interface limpa: botões NÃO geram mensagens “ocultas” no chat (usa deferUpdate)
 
+require("dotenv").config();
 const {
   Client,
   GatewayIntentBits,
@@ -12,427 +13,346 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-} = require('discord.js');
+  EmbedBuilder,
+} = require("discord.js");
 
-// ===== ENV =====
+const express = require("express");
+
+// =======================
+// 0) ENV
+// =======================
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID;
-const CHANNEL_ID = process.env.CHANNEL_ID;
+const GUILD_ID = process.env.GUILD_ID; // opcional (recomendado p/ registrar rápido)
 
-const SHEETS_WEBAPP_URL = process.env.SHEETS_WEBAPP_URL;
-const BOT_SECRET = process.env.BOT_SECRET || '';
-
-function must(v, name) {
-  if (!v) throw new Error(`Faltando ${name} no .env`);
-}
-must(TOKEN, 'DISCORD_TOKEN');
-must(CLIENT_ID, 'CLIENT_ID');
-must(GUILD_ID, 'GUILD_ID');
-must(CHANNEL_ID, 'CHANNEL_ID');
-
-// ====== STATE ======
-const STATE_PATH = path.join(__dirname, 'state.json');
-function readState() {
-  try {
-    if (!fs.existsSync(STATE_PATH)) fs.writeFileSync(STATE_PATH, '{}', 'utf8');
-    return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8') || '{}');
-  } catch {
-    return {};
-  }
-}
-function writeState(state) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), 'utf8');
+if (!TOKEN || !CLIENT_ID) {
+  console.error(
+    "❌ Faltam variáveis .env: DISCORD_TOKEN e/ou CLIENT_ID. (GUILD_ID é opcional)"
+  );
+  process.exit(1);
 }
 
-// ====== CONFIG UI ======
-const ITEMS_PER_PAGE = 4;
-const GREEN = '✅';
-const RED = '❌';
-const EMPTY = '⬜';
+// =======================
+// 1) HTTP server (Render)
+// =======================
+const app = express();
+app.get("/", (req, res) => res.status(200).send("OK"));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`✅ HTTP OK em http://localhost:${PORT}`));
 
-// ====== Slash commands ======
+// =======================
+// 2) Discord client
+// =======================
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+});
+
+// =======================
+// 3) Estado em memória
+// =======================
+// messageId -> state
+// state = { orderId, customerName, page, perPage, products: [{name, qty, status:null|'TENHO'|'FALTA'}] }
+const ordersByMessageId = new Map();
+
+// =======================
+// 4) Slash commands
+// =======================
 const commands = [
-  new SlashCommandBuilder().setName('ping').setDescription('Teste rápido'),
-  new SlashCommandBuilder().setName('pedido').setDescription('Cria um pedido de teste com botões'),
+  new SlashCommandBuilder().setName("ping").setDescription("Testa o bot."),
+  new SlashCommandBuilder()
+    .setName("pedido")
+    .setDescription("Cria uma mensagem de conferência de pedido (demo)."),
 ].map((c) => c.toJSON());
 
 async function registerCommands() {
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log('✅ Comandos /ping e /pedido registrados');
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+  try {
+    if (GUILD_ID) {
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
+        body: commands,
+      });
+      console.log("✅ Comandos /ping e /pedido registrados (GUILD).");
+    } else {
+      await rest.put(Routes.applicationCommands(CLIENT_ID), {
+        body: commands,
+      });
+      console.log("✅ Comandos /ping e /pedido registrados (GLOBAL).");
+    }
+  } catch (err) {
+    console.error("❌ Erro registrando comandos:", err);
+  }
 }
 
-// ====== Client ======
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-client.once('ready', async () => {
-  console.log(`🤖 Bot online como: ${client.user.tag}`);
-  await registerCommands();
-});
-
-// ===== Helpers UI =====
-function buildPedidoKey(pedido) {
-  return String(pedido).trim();
-}
-
-function calcTotalPages(nItems) {
-  return Math.max(1, Math.ceil(nItems / ITEMS_PER_PAGE));
-}
-
-function getPageItems(items, page) {
-  const start = (page - 1) * ITEMS_PER_PAGE;
-  return items.slice(start, start + ITEMS_PER_PAGE);
+// =======================
+// 5) Helpers de UI
+// =======================
+function computeOrderStatus(products) {
+  const allMarked = products.every((p) => p.status === "TENHO" || p.status === "FALTA");
+  return allMarked ? "COMPLETO" : "PENDENTE";
 }
 
 function statusEmoji(status) {
-  if (status === 'tenho') return GREEN;
-  if (status === 'falta') return RED;
-  return EMPTY;
+  if (status === "TENHO") return "✅";
+  if (status === "FALTA") return "❌";
+  return "⬜";
 }
 
-function computePedidoStatus(allStatuses, nItems) {
-  const vals = Object.values(allStatuses || {});
-  if (!nItems) return 'PENDENTE';
-  if (vals.some((v) => v === 'falta')) return 'INCOMPLETO';
-  const filled = Object.keys(allStatuses || {}).length;
-  if (filled === nItems && vals.every((v) => v === 'tenho')) return 'COMPLETO';
-  return 'PENDENTE';
+function buildEmbed(state) {
+  const totalPages = Math.max(1, Math.ceil(state.products.length / state.perPage));
+  const page = Math.min(Math.max(0, state.page), totalPages - 1);
+
+  const start = page * state.perPage;
+  const end = Math.min(start + state.perPage, state.products.length);
+  const pageItems = state.products.slice(start, end);
+
+  const lines = [];
+  for (let i = start; i < end; i++) {
+    const p = state.products[i];
+    lines.push(`${statusEmoji(p.status)} **${i + 1}. ${p.name}** x${p.qty}`);
+  }
+
+  const orderStatus = computeOrderStatus(state.products);
+
+  const embed = new EmbedBuilder()
+    .setTitle("📦 Conferência de Pedido")
+    .setDescription(
+      [
+        `**Pedido:** ${state.orderId}`,
+        `**Cliente:** ${state.customerName}`,
+        `**Status do pedido:** **${orderStatus}**`,
+        "",
+        "**Produtos:**",
+        lines.join("\n"),
+        "",
+        `Página **${page + 1}/${totalPages}**`,
+      ].join("\n")
+    )
+    .setFooter({ text: "Marque item por item ou use os botões da página." });
+
+  return embed;
 }
 
-function buildMessageContent(state, pedidoKey) {
-  const p = state[pedidoKey];
-  const items = p.items;
-  const page = p.page || 1;
+function buildComponents(messageId, state) {
+  const totalPages = Math.max(1, Math.ceil(state.products.length / state.perPage));
+  const page = Math.min(Math.max(0, state.page), totalPages - 1);
 
-  const totalPages = calcTotalPages(items.length);
-  const safePage = Math.min(Math.max(page, 1), totalPages);
-
-  const statusPedido = computePedidoStatus(p.statusByIndex, items.length);
-  const statusLine =
-    statusPedido === 'COMPLETO'
-      ? `Status do pedido: **COMPLETO** ${GREEN}`
-      : statusPedido === 'INCOMPLETO'
-        ? `Status do pedido: **INCOMPLETO** ${RED}`
-        : `Status do pedido: **PENDENTE** ${EMPTY}`;
-
-  const linhas = items
-    .map((it, idx) => {
-      const st = (p.statusByIndex || {})[idx + 1] || '';
-      return `${statusEmoji(st)} ${idx + 1}. ${it.nome} x${it.qtd}`;
-    })
-    .join('\n');
-
-  return (
-    `📦 **Pedido #${p.pedido}**\n` +
-    `👤 **Cliente:** ${p.cliente}\n\n` +
-    `**Produtos:**\n${linhas}\n\n` +
-    `${statusLine}\n` +
-    `📄 Página: **${safePage}/${totalPages}**\n` +
-    `👇 Marque item por item ou use os botões de **Tudo desta página**.`
-  );
-}
-
-function buildComponents(state, pedidoKey) {
-  const p = state[pedidoKey];
-  const items = p.items;
-  const page = p.page || 1;
-
-  const totalPages = calcTotalPages(items.length);
-  const safePage = Math.min(Math.max(page, 1), totalPages);
-
-  const pageItems = getPageItems(items, safePage);
-  const startIndex = (safePage - 1) * ITEMS_PER_PAGE;
+  const start = page * state.perPage;
+  const end = Math.min(start + state.perPage, state.products.length);
 
   const rows = [];
 
-  pageItems.forEach((it, i) => {
-    const itemIndex = startIndex + i + 1;
-    rows.push(
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`tenho:${pedidoKey}:${itemIndex}`)
-          .setLabel(`Tenho (Prod ${itemIndex})`)
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId(`falta:${pedidoKey}:${itemIndex}`)
-          .setLabel(`Falta (Prod ${itemIndex})`)
-          .setStyle(ButtonStyle.Danger)
-      )
-    );
-  });
+  // 1 row por produto (2 botões por linha)
+  for (let i = start; i < end; i++) {
+    const p = state.products[i];
+
+    const tenhoBtn = new ButtonBuilder()
+      .setCustomId(`tenho:${i}`)
+      .setLabel(`Tenho ${i + 1}`)
+      .setStyle(ButtonStyle.Success);
+
+    const faltaBtn = new ButtonBuilder()
+      .setCustomId(`falta:${i}`)
+      .setLabel(`Falta ${i + 1}`)
+      .setStyle(ButtonStyle.Danger);
+
+    // Se quiser “travar” quando já marcado:
+    if (p.status === "TENHO") tenhoBtn.setDisabled(true);
+    if (p.status === "FALTA") faltaBtn.setDisabled(true);
+
+    rows.push(new ActionRowBuilder().addComponents(tenhoBtn, faltaBtn));
+  }
+
+  // Linha de navegação + ações por página
+  const prevBtn = new ButtonBuilder()
+    .setCustomId(`prev`)
+    .setLabel("⬅️ Página anterior")
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(page <= 0);
+
+  const nextBtn = new ButtonBuilder()
+    .setCustomId(`next`)
+    .setLabel("Próxima página ➡️")
+    .setStyle(ButtonStyle.Secondary)
+    .setDisabled(page >= totalPages - 1);
+
+  const tenhoPageBtn = new ButtonBuilder()
+    .setCustomId(`tenho_page`)
+    .setLabel("Tenho todos desta página")
+    .setStyle(ButtonStyle.Success);
+
+  const faltaPageBtn = new ButtonBuilder()
+    .setCustomId(`falta_page`)
+    .setLabel("Falta todos desta página")
+    .setStyle(ButtonStyle.Danger);
 
   rows.push(
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`tenho_all:${pedidoKey}:${safePage}`)
-        .setLabel('Tenho todos (página)')
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId(`falta_all:${pedidoKey}:${safePage}`)
-        .setLabel('Falta todos (página)')
-        .setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId(`prev:${pedidoKey}`)
-        .setLabel('⬅️')
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(safePage <= 1),
-      new ButtonBuilder()
-        .setCustomId(`next:${pedidoKey}`)
-        .setLabel('➡️')
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(safePage >= totalPages)
-    )
+    new ActionRowBuilder().addComponents(prevBtn, nextBtn, tenhoPageBtn, faltaPageBtn)
   );
 
-  return rows;
+  // Limite do Discord: 5 linhas no máximo.
+  // Com perPage=4 => 4 linhas produtos + 1 navegação = 5 (ok).
+  return rows.slice(0, 5);
 }
 
-async function updatePedidoMessage(interaction, pedidoKey) {
-  const state = readState();
-  const p = state[pedidoKey];
-  if (!p) return;
-
-  await interaction.message.edit({
-    content: buildMessageContent(state, pedidoKey),
-    components: buildComponents(state, pedidoKey),
-  });
-}
-
-async function postToSheetsUpdate({ pedido, itemKey, itemIndex, status, user, messageId }) {
-  if (!SHEETS_WEBAPP_URL) return;
-
-  const payload = {
-    secret: BOT_SECRET || '',
-    pedido: String(pedido),
-    itemKey: String(itemKey),
-    itemIndex: Number(itemIndex),
-    status: String(status).toUpperCase(),
-    user: String(user || ''),
-    messageId: String(messageId || ''),
+function buildMessagePayload(messageId, state) {
+  return {
+    embeds: [buildEmbed(state)],
+    components: buildComponents(messageId, state),
   };
-
-  try {
-    const res = await fetch(SHEETS_WEBAPP_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      console.log('❌ Sheets update error:', res.status, txt);
-    }
-  } catch (e) {
-    console.log('❌ Sheets fetch failed:', e);
-  }
 }
 
-async function ephemeralAck(interaction, text) {
-  try {
-    if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ ephemeral: true });
-    }
-    await interaction.editReply({ content: text });
-  } catch (e) {
-    console.log('❌ ephemeralAck error:', e);
-  }
+// =======================
+// 6) Criar pedido demo
+// =======================
+function makeDemoOrder() {
+  // Ajuste aqui para puxar dados reais depois
+  const products = Array.from({ length: 12 }).map((_, idx) => ({
+    name: `Produto ${idx + 1}`,
+    qty: (idx % 2) + 1,
+    status: null,
+  }));
+
+  return {
+    orderId: `#${Math.floor(100000 + Math.random() * 900000)}`,
+    customerName: "Cliente João",
+    page: 0,
+    perPage: 4,
+    products,
+  };
 }
 
-// ====== Interactions ======
-client.on('interactionCreate', async (interaction) => {
+// =======================
+// 7) Interactions
+// =======================
+client.on("interactionCreate", async (interaction) => {
   try {
+    // -------------------
+    // SLASH COMMANDS
+    // -------------------
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === 'ping') {
-        await interaction.reply({ content: '🏓 Pong!', ephemeral: true });
+      if (interaction.commandName === "ping") {
+        // Para evitar timeout em cold start: sempre defer
+        await interaction.deferReply({ ephemeral: true });
+        await interaction.editReply("🏓 Pong! Bot online.");
         return;
       }
 
-      if (interaction.commandName === 'pedido') {
-        // Se demorar, melhor já “segurar” a interação
-        await interaction.deferReply({ ephemeral: true });
+      if (interaction.commandName === "pedido") {
+        // Mensagem no canal (não ephemeral)
+        await interaction.deferReply();
 
-        const state = readState();
+        const state = makeDemoOrder();
 
-        // pedido demo
-        const pedido = '5905';
-        const cliente = 'João';
-        const items = Array.from({ length: 12 }, (_, i) => ({
-          nome: `Produto ${i + 1}`,
-          qtd: i % 2 ? 2 : 1,
-        }));
+        // Envia a mensagem “principal” via editReply (vira a própria mensagem do comando)
+        const tempPayload = buildMessagePayload("temp", state);
+        const msg = await interaction.editReply(tempPayload);
 
-        const pedidoKey = buildPedidoKey(pedido);
-        state[pedidoKey] = { pedido, cliente, items, page: 1, statusByIndex: {} };
-        writeState(state);
+        // Agora temos messageId real
+        ordersByMessageId.set(msg.id, state);
 
-        // Envia no canal (público)
-        const ch = await client.channels.fetch(CHANNEL_ID);
-        await ch.send({
-          content: buildMessageContent(state, pedidoKey),
-          components: buildComponents(state, pedidoKey),
-        });
+        // Re-edita com customIds já ok (não precisa, mas mantém consistente)
+        const realPayload = buildMessagePayload(msg.id, state);
+        await msg.edit(realPayload);
 
-        // Resposta ephem. pro usuário (não dá timeout)
-        await interaction.editReply({ content: '✅ Pedido de teste enviado no canal.' });
         return;
       }
     }
 
+    // -------------------
+    // BUTTONS
+    // -------------------
     if (interaction.isButton()) {
-      // Botões podem demorar -> segura imediatamente
-      await interaction.deferReply({ ephemeral: true });
+      const messageId = interaction.message?.id;
+      const state = ordersByMessageId.get(messageId);
 
-      const [action, pedidoKey, extra] = interaction.customId.split(':');
-      const state = readState();
-      const p = state[pedidoKey];
+      // IMPORTANTÍSSIMO: não poluir chat.
+      // Isso confirma o clique sem mandar mensagens.
+      await interaction.deferUpdate();
 
-      if (!p) {
-        await interaction.editReply({ content: 'Pedido não encontrado na memória.' });
-        return;
-      }
-
-      const userTag = interaction.user?.tag || interaction.user?.username || 'user';
-      const messageId = interaction.message?.id || '';
-
-      if (action === 'prev') {
-        p.page = Math.max(1, (p.page || 1) - 1);
-        state[pedidoKey] = p;
-        writeState(state);
-        await updatePedidoMessage(interaction, pedidoKey);
-        await interaction.editReply({ content: `Página: ${p.page}` });
-        return;
-      }
-
-      if (action === 'next') {
-        const totalPages = calcTotalPages(p.items.length);
-        p.page = Math.min(totalPages, (p.page || 1) + 1);
-        state[pedidoKey] = p;
-        writeState(state);
-        await updatePedidoMessage(interaction, pedidoKey);
-        await interaction.editReply({ content: `Página: ${p.page}` });
-        return;
-      }
-
-      if (action === 'tenho' || action === 'falta') {
-        const idx = Number(extra);
-        p.statusByIndex = p.statusByIndex || {};
-        p.statusByIndex[idx] = action;
-        state[pedidoKey] = p;
-        writeState(state);
-
-        const itemKey = `${p.pedido}#${String(idx).padStart(2, '0')}`;
-        await postToSheetsUpdate({
-          pedido: p.pedido,
-          itemKey,
-          itemIndex: idx,
-          status: action === 'tenho' ? 'TENHO' : 'FALTA',
-          user: userTag,
-          messageId,
+      if (!state) {
+        // Caso a mensagem seja antiga e o bot tenha reiniciado (memória perdeu)
+        // Envia só para quem clicou (não polui)
+        await interaction.followUp({
+          content:
+            "⚠️ Não encontrei esse pedido na memória (o bot pode ter reiniciado). Rode /pedido novamente.",
+          ephemeral: true,
         });
-
-        await updatePedidoMessage(interaction, pedidoKey);
-        await interaction.editReply({ content: `✅ Atualizado (oculto): ${itemKey} = ${action.toUpperCase()}` });
         return;
       }
 
-      if (action === 'tenho_all' || action === 'falta_all') {
-        const page = Number(extra);
-        const pageItems = getPageItems(p.items, page);
-        const startIndex = (page - 1) * ITEMS_PER_PAGE;
-        p.statusByIndex = p.statusByIndex || {};
+      const id = interaction.customId;
 
-        const isTenho = action === 'tenho_all';
-        for (let i = 0; i < pageItems.length; i++) {
-          const idx = startIndex + i + 1;
-          p.statusByIndex[idx] = isTenho ? 'tenho' : 'falta';
+      // Navegação
+      if (id === "prev") state.page = Math.max(0, state.page - 1);
+      if (id === "next") {
+        const totalPages = Math.max(1, Math.ceil(state.products.length / state.perPage));
+        state.page = Math.min(totalPages - 1, state.page + 1);
+      }
 
-          const itemKey = `${p.pedido}#${String(idx).padStart(2, '0')}`;
-          await postToSheetsUpdate({
-            pedido: p.pedido,
-            itemKey,
-            itemIndex: idx,
-            status: isTenho ? 'TENHO' : 'FALTA',
-            user: userTag,
-            messageId,
+      // Ações por item
+      if (id.startsWith("tenho:")) {
+        const idx = Number(id.split(":")[1]);
+        if (!Number.isNaN(idx) && state.products[idx]) state.products[idx].status = "TENHO";
+      }
+
+      if (id.startsWith("falta:")) {
+        const idx = Number(id.split(":")[1]);
+        if (!Number.isNaN(idx) && state.products[idx]) state.products[idx].status = "FALTA";
+      }
+
+      // Ações por página
+      if (id === "tenho_page" || id === "falta_page") {
+        const totalPages = Math.max(1, Math.ceil(state.products.length / state.perPage));
+        const page = Math.min(Math.max(0, state.page), totalPages - 1);
+        const start = page * state.perPage;
+        const end = Math.min(start + state.perPage, state.products.length);
+
+        for (let i = start; i < end; i++) {
+          state.products[i].status = id === "tenho_page" ? "TENHO" : "FALTA";
+        }
+      }
+
+      // Salva estado
+      ordersByMessageId.set(messageId, state);
+
+      // Atualiza só a mensagem principal (sem spam)
+      const payload = buildMessagePayload(messageId, state);
+      await interaction.message.edit(payload);
+
+      return;
+    }
+  } catch (err) {
+    console.error("❌ Erro em interactionCreate:", err);
+
+    // Tenta não deixar “interação falhou”
+    try {
+      if (interaction.isRepliable()) {
+        if (interaction.deferred) {
+          await interaction.followUp({
+            content: "❌ Ocorreu um erro interno. Veja os logs no Render.",
+            ephemeral: true,
+          });
+        } else {
+          await interaction.reply({
+            content: "❌ Ocorreu um erro interno. Veja os logs no Render.",
+            ephemeral: true,
           });
         }
-
-        state[pedidoKey] = p;
-        writeState(state);
-
-        await updatePedidoMessage(interaction, pedidoKey);
-        await interaction.editReply({
-          content: `✅ Página ${page} aplicada (oculto): ${isTenho ? 'TENHO TODOS' : 'FALTA TODOS'}`,
-        });
-        return;
       }
-
-      await interaction.editReply({ content: 'Ação não reconhecida.' });
-    }
-  } catch (e) {
-    console.log('❌ Erro:', e);
-    try {
-      if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: 'Erro interno (veja o console).', ephemeral: true });
-      } else if (interaction.isRepliable() && interaction.deferred) {
-        await interaction.editReply({ content: 'Erro interno (veja o console).' });
-      }
-    } catch {}
+    } catch (_) {}
   }
 });
 
-// ====== HTTP endpoint: Apps Script -> Bot -> Discord ======
-const app = express();
-app.use(express.json());
-
-app.post('/push-order', async (req, res) => {
-  try {
-    const body = req.body || {};
-    if (BOT_SECRET && body.secret !== BOT_SECRET) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
-    }
-
-    const pedido = String(body.pedido || '').trim();
-    const cliente = String(body.cliente || '').trim();
-    const items = Array.isArray(body.items) ? body.items : [];
-
-    if (!pedido || !cliente || items.length === 0) {
-      return res.status(400).json({ ok: false, error: 'missing_fields' });
-    }
-
-    const pedidoKey = buildPedidoKey(pedido);
-    const state = readState();
-
-    state[pedidoKey] = {
-      pedido,
-      cliente,
-      items: items
-        .map((it) => ({
-          nome: String(it?.nome || it?.produto || '').trim(),
-          qtd: Number(it?.qtd || it?.quantidade || 1) || 1,
-        }))
-        .filter((it) => it.nome),
-      page: 1,
-      statusByIndex: {},
-    };
-
-    writeState(state);
-
-    const ch = await client.channels.fetch(CHANNEL_ID);
-    const msg = await ch.send({
-      content: buildMessageContent(state, pedidoKey),
-      components: buildComponents(state, pedidoKey),
-    });
-
-    return res.json({ ok: true, messageId: msg.id });
-  } catch (e) {
-    console.log('❌ push-order error:', e);
-    return res.status(500).json({ ok: false, error: String(e) });
-  }
+// =======================
+// 8) Ready
+// =======================
+client.once("ready", () => {
+  console.log(`✅ Bot online como: ${client.user.tag}`);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🌐 HTTP OK em http://localhost:${PORT}`));
-
-client.login(TOKEN);
+// Start
+(async () => {
+  await registerCommands();
+  await client.login(TOKEN);
+})();
