@@ -56,7 +56,7 @@ const EMPTY = '⬜';
 const commands = [
   new SlashCommandBuilder().setName('ping').setDescription('Teste rápido'),
   new SlashCommandBuilder().setName('pedido').setDescription('Cria um pedido de teste com botões'),
-].map(c => c.toJSON());
+].map((c) => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -76,24 +76,28 @@ client.once('ready', async () => {
 function buildPedidoKey(pedido) {
   return String(pedido).trim();
 }
+
 function calcTotalPages(nItems) {
   return Math.max(1, Math.ceil(nItems / ITEMS_PER_PAGE));
 }
+
 function getPageItems(items, page) {
   const start = (page - 1) * ITEMS_PER_PAGE;
   return items.slice(start, start + ITEMS_PER_PAGE);
 }
+
 function statusEmoji(status) {
   if (status === 'tenho') return GREEN;
   if (status === 'falta') return RED;
   return EMPTY;
 }
+
 function computePedidoStatus(allStatuses, nItems) {
   const vals = Object.values(allStatuses || {});
   if (!nItems) return 'PENDENTE';
-  if (vals.some(v => v === 'falta')) return 'INCOMPLETO';
+  if (vals.some((v) => v === 'falta')) return 'INCOMPLETO';
   const filled = Object.keys(allStatuses || {}).length;
-  if (filled === nItems && vals.every(v => v === 'tenho')) return 'COMPLETO';
+  if (filled === nItems && vals.every((v) => v === 'tenho')) return 'COMPLETO';
   return 'PENDENTE';
 }
 
@@ -107,14 +111,18 @@ function buildMessageContent(state, pedidoKey) {
 
   const statusPedido = computePedidoStatus(p.statusByIndex, items.length);
   const statusLine =
-    statusPedido === 'COMPLETO' ? `Status do pedido: **COMPLETO** ${GREEN}` :
-    statusPedido === 'INCOMPLETO' ? `Status do pedido: **INCOMPLETO** ${RED}` :
-    `Status do pedido: **PENDENTE** ${EMPTY}`;
+    statusPedido === 'COMPLETO'
+      ? `Status do pedido: **COMPLETO** ${GREEN}`
+      : statusPedido === 'INCOMPLETO'
+        ? `Status do pedido: **INCOMPLETO** ${RED}`
+        : `Status do pedido: **PENDENTE** ${EMPTY}`;
 
-  const linhas = items.map((it, idx) => {
-    const st = (p.statusByIndex || {})[idx + 1] || '';
-    return `${statusEmoji(st)} ${idx + 1}. ${it.nome} x${it.qtd}`;
-  }).join('\n');
+  const linhas = items
+    .map((it, idx) => {
+      const st = (p.statusByIndex || {})[idx + 1] || '';
+      return `${statusEmoji(st)} ${idx + 1}. ${it.nome} x${it.qtd}`;
+    })
+    .join('\n');
 
   return (
     `📦 **Pedido #${p.pedido}**\n` +
@@ -150,7 +158,7 @@ function buildComponents(state, pedidoKey) {
         new ButtonBuilder()
           .setCustomId(`falta:${pedidoKey}:${itemIndex}`)
           .setLabel(`Falta (Prod ${itemIndex})`)
-          .setStyle(ButtonStyle.Danger),
+          .setStyle(ButtonStyle.Danger)
       )
     );
   });
@@ -174,7 +182,7 @@ function buildComponents(state, pedidoKey) {
         .setCustomId(`next:${pedidoKey}`)
         .setLabel('➡️')
         .setStyle(ButtonStyle.Secondary)
-        .setDisabled(safePage >= totalPages),
+        .setDisabled(safePage >= totalPages)
     )
   );
 
@@ -200,22 +208,23 @@ async function postToSheetsUpdate({ pedido, itemKey, itemIndex, status, user, me
     itemKey: String(itemKey),
     itemIndex: Number(itemIndex),
     status: String(status).toUpperCase(),
-    user: String(user || """"),
-    messageId: String(messageId || """")
+    user: String(user || ''),
+    messageId: String(messageId || ''),
   };
 
   try {
     const res = await fetch(SHEETS_WEBAPP_URL, {
-      method: ""POST"",
-      headers: { ""Content-Type"": ""application/json"" },
-      body: JSON.stringify(payload)
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     });
+
     if (!res.ok) {
-      const txt = await res.text().catch(() => """");
-      console.log(""❌ Sheets update error:"", res.status, txt);
+      const txt = await res.text().catch(() => '');
+      console.log('❌ Sheets update error:', res.status, txt);
     }
   } catch (e) {
-    console.log(""❌ Sheets fetch failed:"", e);
+    console.log('❌ Sheets fetch failed:', e);
   }
 }
 
@@ -243,7 +252,7 @@ client.on('interactionCreate', async (interaction) => {
         const cliente = 'João';
         const items = Array.from({ length: 12 }, (_, i) => ({
           nome: `Produto ${i + 1}`,
-          qtd: (i % 2) ? 2 : 1
+          qtd: i % 2 ? 2 : 1,
         }));
 
         const pedidoKey = buildPedidoKey(pedido);
@@ -264,12 +273,15 @@ client.on('interactionCreate', async (interaction) => {
       const p = state[pedidoKey];
 
       if (!p) {
-        await interaction.reply({ content: 'Pedido não encontrado na memória.', flags: InteractionResponseFlags.Ephemeral });
+        await interaction.reply({
+          content: 'Pedido não encontrado na memória.',
+          flags: InteractionResponseFlags.Ephemeral,
+        });
         return;
       }
 
-      const userTag = interaction.user?.tag || interaction.user?.username || ""user"";
-      const messageId = interaction.message?.id || """";
+      const userTag = interaction.user?.tag || interaction.user?.username || 'user';
+      const messageId = interaction.message?.id || '';
 
       if (action === 'prev') {
         p.page = Math.max(1, (p.page || 1) - 1);
@@ -297,14 +309,14 @@ client.on('interactionCreate', async (interaction) => {
         state[pedidoKey] = p;
         writeState(state);
 
-        const itemKey = `${p.pedido}#${String(idx).padStart(2, ""0"")}`;
+        const itemKey = `${p.pedido}#${String(idx).padStart(2, '0')}`;
         await postToSheetsUpdate({
           pedido: p.pedido,
           itemKey,
           itemIndex: idx,
-          status: action === ""tenho"" ? ""TENHO"" : ""FALTA"",
+          status: action === 'tenho' ? 'TENHO' : 'FALTA',
           user: userTag,
-          messageId
+          messageId,
         });
 
         await updatePedidoMessage(interaction, pedidoKey);
@@ -318,19 +330,19 @@ client.on('interactionCreate', async (interaction) => {
         const startIndex = (page - 1) * ITEMS_PER_PAGE;
         p.statusByIndex = p.statusByIndex || {};
 
-        const isTenho = (action === 'tenho_all');
+        const isTenho = action === 'tenho_all';
         for (let i = 0; i < pageItems.length; i++) {
           const idx = startIndex + i + 1;
           p.statusByIndex[idx] = isTenho ? 'tenho' : 'falta';
 
-          const itemKey = `${p.pedido}#${String(idx).padStart(2, ""0"")}`;
+          const itemKey = `${p.pedido}#${String(idx).padStart(2, '0')}`;
           await postToSheetsUpdate({
             pedido: p.pedido,
             itemKey,
             itemIndex: idx,
-            status: isTenho ? ""TENHO"" : ""FALTA"",
+            status: isTenho ? 'TENHO' : 'FALTA',
             user: userTag,
-            messageId
+            messageId,
           });
         }
 
@@ -338,7 +350,10 @@ client.on('interactionCreate', async (interaction) => {
         writeState(state);
 
         await updatePedidoMessage(interaction, pedidoKey);
-        await ephemeralAck(interaction, `✅ Página ${page} aplicada (oculto): ${isTenho ? 'TENHO TODOS' : 'FALTA TODOS'}`);
+        await ephemeralAck(
+          interaction,
+          `✅ Página ${page} aplicada (oculto): ${isTenho ? 'TENHO TODOS' : 'FALTA TODOS'}`
+        );
         return;
       }
 
@@ -362,15 +377,15 @@ app.post('/push-order', async (req, res) => {
   try {
     const body = req.body || {};
     if (BOT_SECRET && body.secret !== BOT_SECRET) {
-      return res.status(401).json({ ok: false, error: ""unauthorized"" });
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    const pedido = String(body.pedido || """").trim();
-    const cliente = String(body.cliente || """").trim();
+    const pedido = String(body.pedido || '').trim();
+    const cliente = String(body.cliente || '').trim();
     const items = Array.isArray(body.items) ? body.items : [];
 
     if (!pedido || !cliente || items.length === 0) {
-      return res.status(400).json({ ok: false, error: ""missing_fields"" });
+      return res.status(400).json({ ok: false, error: 'missing_fields' });
     }
 
     const pedidoKey = buildPedidoKey(pedido);
@@ -379,12 +394,14 @@ app.post('/push-order', async (req, res) => {
     state[pedidoKey] = {
       pedido,
       cliente,
-      items: items.map(it => ({
-        nome: String(it.nome || it.produto || """").trim(),
-        qtd: Number(it.qtd || it.quantidade || 1) || 1
-      })).filter(it => it.nome),
+      items: items
+        .map((it) => ({
+          nome: String(it?.nome || it?.produto || '').trim(),
+          qtd: Number(it?.qtd || it?.quantidade || 1) || 1,
+        }))
+        .filter((it) => it.nome),
       page: 1,
-      statusByIndex: {}
+      statusByIndex: {},
     };
 
     writeState(state);
@@ -397,7 +414,7 @@ app.post('/push-order', async (req, res) => {
 
     return res.json({ ok: true, messageId: msg.id });
   } catch (e) {
-    console.log(""❌ push-order error:"", e);
+    console.log('❌ push-order error:', e);
     return res.status(500).json({ ok: false, error: String(e) });
   }
 });
