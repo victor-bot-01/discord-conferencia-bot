@@ -1,4 +1,4 @@
-"require('dotenv').config();
+require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -200,22 +200,22 @@ async function postToSheetsUpdate({ pedido, itemKey, itemIndex, status, user, me
     itemKey: String(itemKey),
     itemIndex: Number(itemIndex),
     status: String(status).toUpperCase(),
-    user: String(user || """"""""),
-    messageId: String(messageId || """""""")
+    user: String(user || """"),
+    messageId: String(messageId || """")
   };
 
   try {
     const res = await fetch(SHEETS_WEBAPP_URL, {
-      method: """"POST"""",
-      headers: { """"Content-Type"""": """"application/json"""" },
+      method: ""POST"",
+      headers: { ""Content-Type"": ""application/json"" },
       body: JSON.stringify(payload)
     });
     if (!res.ok) {
-      const txt = await res.text().catch(() => """""""");
-      console.log(""""❌ Sheets update error:"""", res.status, txt);
+      const txt = await res.text().catch(() => """");
+      console.log(""❌ Sheets update error:"", res.status, txt);
     }
   } catch (e) {
-    console.log(""""❌ Sheets fetch failed:"""", e);
+    console.log(""❌ Sheets fetch failed:"", e);
   }
 }
 
@@ -268,8 +268,8 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      const userTag = interaction.user?.tag || interaction.user?.username || """"user"""";
-      const messageId = interaction.message?.id || """""""";
+      const userTag = interaction.user?.tag || interaction.user?.username || ""user"";
+      const messageId = interaction.message?.id || """";
 
       if (action === 'prev') {
         p.page = Math.max(1, (p.page || 1) - 1);
@@ -297,12 +297,12 @@ client.on('interactionCreate', async (interaction) => {
         state[pedidoKey] = p;
         writeState(state);
 
-        const itemKey = `${p.pedido}#${String(idx).padStart(2, """"0"""")}`;
+        const itemKey = `${p.pedido}#${String(idx).padStart(2, ""0"")}`;
         await postToSheetsUpdate({
           pedido: p.pedido,
           itemKey,
           itemIndex: idx,
-          status: action === """"tenho"""" ? """"TENHO"""" : """"FALTA"""",
+          status: action === ""tenho"" ? ""TENHO"" : ""FALTA"",
           user: userTag,
           messageId
         });
@@ -323,12 +323,12 @@ client.on('interactionCreate', async (interaction) => {
           const idx = startIndex + i + 1;
           p.statusByIndex[idx] = isTenho ? 'tenho' : 'falta';
 
-          const itemKey = `${p.pedido}#${String(idx).padStart(2, """"0"""")}`;
+          const itemKey = `${p.pedido}#${String(idx).padStart(2, ""0"")}`;
           await postToSheetsUpdate({
             pedido: p.pedido,
             itemKey,
             itemIndex: idx,
-            status: isTenho ? """"TENHO"""" : """"FALTA"""",
+            status: isTenho ? ""TENHO"" : ""FALTA"",
             user: userTag,
             messageId
           });
@@ -354,92 +354,50 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ====== Delete message endpoints ======
+// ====== HTTP endpoint: Apps Script -> Bot -> Discord ======
+const app = express();
+app.use(express.json());
 
-// POST /delete-message
-// body: { secret, messageId }
-app.post('/delete-message', async (req, res) => {
+app.post('/push-order', async (req, res) => {
   try {
     const body = req.body || {};
     if (BOT_SECRET && body.secret !== BOT_SECRET) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
+      return res.status(401).json({ ok: false, error: ""unauthorized"" });
     }
 
-    const messageId = String(body.messageId || "").trim();
-    if (!messageId) {
-      return res.status(400).json({ ok: false, error: "missing_messageId" });
-    }
+    const pedido = String(body.pedido || """").trim();
+    const cliente = String(body.cliente || """").trim();
+    const items = Array.isArray(body.items) ? body.items : [];
 
-    const ch = await client.channels.fetch(CHANNEL_ID);
-
-    // tenta buscar e apagar
-    const msg = await ch.messages.fetch(messageId).catch(() => null);
-    if (!msg) {
-      return res.status(404).json({ ok: false, error: "message_not_found", messageId });
-    }
-
-    await msg.delete().catch((e) => {
-      throw new Error("delete_failed: " + String(e?.message || e));
-    });
-
-    // opcional: remove do state se estiver registrado
-    const state = readState();
-    for (const k of Object.keys(state)) {
-      if (state[k]?.messageId === messageId) {
-        delete state[k];
-      }
-    }
-    writeState(state);
-
-    return res.json({ ok: true, deleted: true, messageId });
-  } catch (e) {
-    console.log("❌ delete-message error:", e);
-    return res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
-// POST /confirm-order
-// body: { secret, pedido }   (opcionalmente pode mandar messageId também)
-// regra: apaga a mensagem do pedido usando o messageId salvo no state
-app.post('/confirm-order', async (req, res) => {
-  try {
-    const body = req.body || {};
-    if (BOT_SECRET && body.secret !== BOT_SECRET) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-
-    const pedido = String(body.pedido || "").trim();
-    if (!pedido) {
-      return res.status(400).json({ ok: false, error: "missing_pedido" });
+    if (!pedido || !cliente || items.length === 0) {
+      return res.status(400).json({ ok: false, error: ""missing_fields"" });
     }
 
     const pedidoKey = buildPedidoKey(pedido);
     const state = readState();
-    const p = state[pedidoKey];
 
-    const messageId = String(body.messageId || p?.messageId || "").trim();
-    if (!messageId) {
-      return res.status(404).json({ ok: false, error: "messageId_not_found_for_pedido", pedido });
-    }
+    state[pedidoKey] = {
+      pedido,
+      cliente,
+      items: items.map(it => ({
+        nome: String(it.nome || it.produto || """").trim(),
+        qtd: Number(it.qtd || it.quantidade || 1) || 1
+      })).filter(it => it.nome),
+      page: 1,
+      statusByIndex: {}
+    };
 
-    const ch = await client.channels.fetch(CHANNEL_ID);
-    const msg = await ch.messages.fetch(messageId).catch(() => null);
-    if (!msg) {
-      // se não existe mais, limpa state e segue
-      delete state[pedidoKey];
-      writeState(state);
-      return res.status(404).json({ ok: false, error: "message_not_found", pedido, messageId });
-    }
-
-    await msg.delete();
-
-    // limpa state do pedido
-    delete state[pedidoKey];
     writeState(state);
 
-    return res.json({ ok: true, deleted: true, pedido, messageId });
+    const ch = await client.channels.fetch(CHANNEL_ID);
+    const msg = await ch.send({
+      content: buildMessageContent(state, pedidoKey),
+      components: buildComponents(state, pedidoKey),
+    });
+
+    return res.json({ ok: true, messageId: msg.id });
   } catch (e) {
-    console.log("❌ confirm-order error:", e);
+    console.log(""❌ push-order error:"", e);
     return res.status(500).json({ ok: false, error: String(e) });
   }
 });
@@ -448,4 +406,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 HTTP OK em http://localhost:${PORT}`));
 
 client.login(TOKEN);
-"
