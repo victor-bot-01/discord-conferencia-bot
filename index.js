@@ -1,9 +1,3 @@
-/**
- * index.js — versão completa (corrigida)
- * Correção principal: /pedido e /ping agora usam deferReply() + editReply()
- * para evitar "O aplicativo não respondeu" no Discord.
- */
-
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -18,7 +12,6 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  InteractionResponseFlags,
 } = require('discord.js');
 
 // ===== ENV =====
@@ -40,7 +33,6 @@ must(CHANNEL_ID, 'CHANNEL_ID');
 
 // ====== STATE ======
 const STATE_PATH = path.join(__dirname, 'state.json');
-
 function readState() {
   try {
     if (!fs.existsSync(STATE_PATH)) fs.writeFileSync(STATE_PATH, '{}', 'utf8');
@@ -49,7 +41,6 @@ function readState() {
     return {};
   }
 }
-
 function writeState(state) {
   fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), 'utf8');
 }
@@ -77,11 +68,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.once('ready', async () => {
   console.log(`🤖 Bot online como: ${client.user.tag}`);
-  try {
-    await registerCommands();
-  } catch (e) {
-    console.log('❌ Falha ao registrar comandos:', e);
-  }
+  await registerCommands();
 });
 
 // ===== Helpers UI =====
@@ -108,10 +95,8 @@ function computePedidoStatus(allStatuses, nItems) {
   const vals = Object.values(allStatuses || {});
   if (!nItems) return 'PENDENTE';
   if (vals.some((v) => v === 'falta')) return 'INCOMPLETO';
-
   const filled = Object.keys(allStatuses || {}).length;
   if (filled === nItems && vals.every((v) => v === 'tenho')) return 'COMPLETO';
-
   return 'PENDENTE';
 }
 
@@ -161,7 +146,7 @@ function buildComponents(state, pedidoKey) {
 
   const rows = [];
 
-  pageItems.forEach((_, i) => {
+  pageItems.forEach((it, i) => {
     const itemIndex = startIndex + i + 1;
     rows.push(
       new ActionRowBuilder().addComponents(
@@ -244,66 +229,66 @@ async function postToSheetsUpdate({ pedido, itemKey, itemIndex, status, user, me
 }
 
 async function ephemeralAck(interaction, text) {
-  if (!interaction.deferred && !interaction.replied) {
-    await interaction.deferReply({ flags: InteractionResponseFlags.Ephemeral });
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ ephemeral: true });
+    }
+    await interaction.editReply({ content: text });
+  } catch (e) {
+    console.log('❌ ephemeralAck error:', e);
   }
-  await interaction.editReply({ content: text });
 }
 
 // ====== Interactions ======
 client.on('interactionCreate', async (interaction) => {
   try {
-    // ===== Slash Commands =====
-if (interaction.isChatInputCommand()) {
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'ping') {
+        await interaction.reply({ content: '🏓 Pong!', ephemeral: true });
+        return;
+      }
 
-  // SEMPRE defer
-  await interaction.deferReply({ flags: InteractionResponseFlags.Ephemeral });
+      if (interaction.commandName === 'pedido') {
+        // Se demorar, melhor já “segurar” a interação
+        await interaction.deferReply({ ephemeral: true });
 
-  if (interaction.commandName === 'ping') {
-    await interaction.editReply('🏓 Pong!');
-    return;
-  }
+        const state = readState();
 
-  if (interaction.commandName === 'pedido') {
-    const state = readState();
+        // pedido demo
+        const pedido = '5905';
+        const cliente = 'João';
+        const items = Array.from({ length: 12 }, (_, i) => ({
+          nome: `Produto ${i + 1}`,
+          qtd: i % 2 ? 2 : 1,
+        }));
 
-    const pedido = '5905';
-    const cliente = 'João';
-    const items = Array.from({ length: 12 }, (_, i) => ({
-      nome: `Produto ${i + 1}`,
-      qtd: i % 2 ? 2 : 1,
-    }));
+        const pedidoKey = buildPedidoKey(pedido);
+        state[pedidoKey] = { pedido, cliente, items, page: 1, statusByIndex: {} };
+        writeState(state);
 
-    const pedidoKey = buildPedidoKey(pedido);
-    state[pedidoKey] = {
-      pedido,
-      cliente,
-      items,
-      page: 1,
-      statusByIndex: {},
-    };
+        // Envia no canal (público)
+        const ch = await client.channels.fetch(CHANNEL_ID);
+        await ch.send({
+          content: buildMessageContent(state, pedidoKey),
+          components: buildComponents(state, pedidoKey),
+        });
 
-    writeState(state);
+        // Resposta ephem. pro usuário (não dá timeout)
+        await interaction.editReply({ content: '✅ Pedido de teste enviado no canal.' });
+        return;
+      }
+    }
 
-    await interaction.editReply({
-      content: buildMessageContent(state, pedidoKey),
-      components: buildComponents(state, pedidoKey),
-    });
-    return;
-  }
-}
-
-    // ===== Buttons =====
     if (interaction.isButton()) {
+      // Botões podem demorar -> segura imediatamente
+      await interaction.deferReply({ ephemeral: true });
+
       const [action, pedidoKey, extra] = interaction.customId.split(':');
       const state = readState();
       const p = state[pedidoKey];
 
       if (!p) {
-        await interaction.reply({
-          content: 'Pedido não encontrado na memória.',
-          flags: InteractionResponseFlags.Ephemeral,
-        });
+        await interaction.editReply({ content: 'Pedido não encontrado na memória.' });
         return;
       }
 
@@ -314,9 +299,8 @@ if (interaction.isChatInputCommand()) {
         p.page = Math.max(1, (p.page || 1) - 1);
         state[pedidoKey] = p;
         writeState(state);
-
         await updatePedidoMessage(interaction, pedidoKey);
-        await ephemeralAck(interaction, `Página: ${p.page}`);
+        await interaction.editReply({ content: `Página: ${p.page}` });
         return;
       }
 
@@ -325,22 +309,19 @@ if (interaction.isChatInputCommand()) {
         p.page = Math.min(totalPages, (p.page || 1) + 1);
         state[pedidoKey] = p;
         writeState(state);
-
         await updatePedidoMessage(interaction, pedidoKey);
-        await ephemeralAck(interaction, `Página: ${p.page}`);
+        await interaction.editReply({ content: `Página: ${p.page}` });
         return;
       }
 
       if (action === 'tenho' || action === 'falta') {
         const idx = Number(extra);
-
         p.statusByIndex = p.statusByIndex || {};
         p.statusByIndex[idx] = action;
         state[pedidoKey] = p;
         writeState(state);
 
         const itemKey = `${p.pedido}#${String(idx).padStart(2, '0')}`;
-
         await postToSheetsUpdate({
           pedido: p.pedido,
           itemKey,
@@ -351,7 +332,7 @@ if (interaction.isChatInputCommand()) {
         });
 
         await updatePedidoMessage(interaction, pedidoKey);
-        await ephemeralAck(interaction, `✅ Atualizado (oculto): ${itemKey} = ${action.toUpperCase()}`);
+        await interaction.editReply({ content: `✅ Atualizado (oculto): ${itemKey} = ${action.toUpperCase()}` });
         return;
       }
 
@@ -359,10 +340,9 @@ if (interaction.isChatInputCommand()) {
         const page = Number(extra);
         const pageItems = getPageItems(p.items, page);
         const startIndex = (page - 1) * ITEMS_PER_PAGE;
-
         p.statusByIndex = p.statusByIndex || {};
-        const isTenho = action === 'tenho_all';
 
+        const isTenho = action === 'tenho_all';
         for (let i = 0; i < pageItems.length; i++) {
           const idx = startIndex + i + 1;
           p.statusByIndex[idx] = isTenho ? 'tenho' : 'falta';
@@ -382,23 +362,21 @@ if (interaction.isChatInputCommand()) {
         writeState(state);
 
         await updatePedidoMessage(interaction, pedidoKey);
-        await ephemeralAck(
-          interaction,
-          `✅ Página ${page} aplicada (oculto): ${isTenho ? 'TENHO TODOS' : 'FALTA TODOS'}`
-        );
+        await interaction.editReply({
+          content: `✅ Página ${page} aplicada (oculto): ${isTenho ? 'TENHO TODOS' : 'FALTA TODOS'}`,
+        });
         return;
       }
 
-      await ephemeralAck(interaction, 'Ação não reconhecida.');
+      await interaction.editReply({ content: 'Ação não reconhecida.' });
     }
   } catch (e) {
     console.log('❌ Erro:', e);
     try {
-      if (interaction.isRepliable() && !interaction.replied) {
-        await interaction.reply({
-          content: 'Erro interno (veja o console).',
-          flags: InteractionResponseFlags.Ephemeral,
-        });
+      if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: 'Erro interno (veja o console).', ephemeral: true });
+      } else if (interaction.isRepliable() && interaction.deferred) {
+        await interaction.editReply({ content: 'Erro interno (veja o console).' });
       }
     } catch {}
   }
@@ -407,9 +385,6 @@ if (interaction.isChatInputCommand()) {
 // ====== HTTP endpoint: Apps Script -> Bot -> Discord ======
 const app = express();
 app.use(express.json());
-
-// (opcional) health check
-app.get('/', (_req, res) => res.status(200).send('OK'));
 
 app.post('/push-order', async (req, res) => {
   try {
