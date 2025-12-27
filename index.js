@@ -1,3 +1,9 @@
+/**
+ * index.js — versão completa (corrigida)
+ * Correção principal: /pedido e /ping agora usam deferReply() + editReply()
+ * para evitar "O aplicativo não respondeu" no Discord.
+ */
+
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -34,6 +40,7 @@ must(CHANNEL_ID, 'CHANNEL_ID');
 
 // ====== STATE ======
 const STATE_PATH = path.join(__dirname, 'state.json');
+
 function readState() {
   try {
     if (!fs.existsSync(STATE_PATH)) fs.writeFileSync(STATE_PATH, '{}', 'utf8');
@@ -42,6 +49,7 @@ function readState() {
     return {};
   }
 }
+
 function writeState(state) {
   fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), 'utf8');
 }
@@ -61,7 +69,7 @@ const commands = [
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log('✅ Comando /pedido registrado');
+  console.log('✅ Comandos /ping e /pedido registrados');
 }
 
 // ====== Client ======
@@ -69,7 +77,11 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.once('ready', async () => {
   console.log(`🤖 Bot online como: ${client.user.tag}`);
-  await registerCommands();
+  try {
+    await registerCommands();
+  } catch (e) {
+    console.log('❌ Falha ao registrar comandos:', e);
+  }
 });
 
 // ===== Helpers UI =====
@@ -96,8 +108,10 @@ function computePedidoStatus(allStatuses, nItems) {
   const vals = Object.values(allStatuses || {});
   if (!nItems) return 'PENDENTE';
   if (vals.some((v) => v === 'falta')) return 'INCOMPLETO';
+
   const filled = Object.keys(allStatuses || {}).length;
   if (filled === nItems && vals.every((v) => v === 'tenho')) return 'COMPLETO';
+
   return 'PENDENTE';
 }
 
@@ -147,7 +161,7 @@ function buildComponents(state, pedidoKey) {
 
   const rows = [];
 
-  pageItems.forEach((it, i) => {
+  pageItems.forEach((_, i) => {
     const itemIndex = startIndex + i + 1;
     rows.push(
       new ActionRowBuilder().addComponents(
@@ -193,6 +207,7 @@ async function updatePedidoMessage(interaction, pedidoKey) {
   const state = readState();
   const p = state[pedidoKey];
   if (!p) return;
+
   await interaction.message.edit({
     content: buildMessageContent(state, pedidoKey),
     components: buildComponents(state, pedidoKey),
@@ -238,13 +253,19 @@ async function ephemeralAck(interaction, text) {
 // ====== Interactions ======
 client.on('interactionCreate', async (interaction) => {
   try {
+    // ===== Slash Commands =====
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'ping') {
-        await interaction.reply({ content: '🏓 Pong!', flags: InteractionResponseFlags.Ephemeral });
+        // Evita timeout
+        await interaction.deferReply({ flags: InteractionResponseFlags.Ephemeral });
+        await interaction.editReply({ content: '🏓 Pong!' });
         return;
       }
 
       if (interaction.commandName === 'pedido') {
+        // Evita "O aplicativo não respondeu"
+        await interaction.deferReply(); // resposta pública no canal
+
         const state = readState();
 
         // pedido demo
@@ -259,14 +280,17 @@ client.on('interactionCreate', async (interaction) => {
         state[pedidoKey] = { pedido, cliente, items, page: 1, statusByIndex: {} };
         writeState(state);
 
-        await interaction.reply({
+        await interaction.editReply({
           content: buildMessageContent(state, pedidoKey),
           components: buildComponents(state, pedidoKey),
         });
         return;
       }
+
+      return;
     }
 
+    // ===== Buttons =====
     if (interaction.isButton()) {
       const [action, pedidoKey, extra] = interaction.customId.split(':');
       const state = readState();
@@ -287,6 +311,7 @@ client.on('interactionCreate', async (interaction) => {
         p.page = Math.max(1, (p.page || 1) - 1);
         state[pedidoKey] = p;
         writeState(state);
+
         await updatePedidoMessage(interaction, pedidoKey);
         await ephemeralAck(interaction, `Página: ${p.page}`);
         return;
@@ -297,6 +322,7 @@ client.on('interactionCreate', async (interaction) => {
         p.page = Math.min(totalPages, (p.page || 1) + 1);
         state[pedidoKey] = p;
         writeState(state);
+
         await updatePedidoMessage(interaction, pedidoKey);
         await ephemeralAck(interaction, `Página: ${p.page}`);
         return;
@@ -304,12 +330,14 @@ client.on('interactionCreate', async (interaction) => {
 
       if (action === 'tenho' || action === 'falta') {
         const idx = Number(extra);
+
         p.statusByIndex = p.statusByIndex || {};
         p.statusByIndex[idx] = action;
         state[pedidoKey] = p;
         writeState(state);
 
         const itemKey = `${p.pedido}#${String(idx).padStart(2, '0')}`;
+
         await postToSheetsUpdate({
           pedido: p.pedido,
           itemKey,
@@ -328,9 +356,10 @@ client.on('interactionCreate', async (interaction) => {
         const page = Number(extra);
         const pageItems = getPageItems(p.items, page);
         const startIndex = (page - 1) * ITEMS_PER_PAGE;
-        p.statusByIndex = p.statusByIndex || {};
 
+        p.statusByIndex = p.statusByIndex || {};
         const isTenho = action === 'tenho_all';
+
         for (let i = 0; i < pageItems.length; i++) {
           const idx = startIndex + i + 1;
           p.statusByIndex[idx] = isTenho ? 'tenho' : 'falta';
@@ -363,7 +392,10 @@ client.on('interactionCreate', async (interaction) => {
     console.log('❌ Erro:', e);
     try {
       if (interaction.isRepliable() && !interaction.replied) {
-        await interaction.reply({ content: 'Erro interno (veja o console).', flags: InteractionResponseFlags.Ephemeral });
+        await interaction.reply({
+          content: 'Erro interno (veja o console).',
+          flags: InteractionResponseFlags.Ephemeral,
+        });
       }
     } catch {}
   }
@@ -372,6 +404,9 @@ client.on('interactionCreate', async (interaction) => {
 // ====== HTTP endpoint: Apps Script -> Bot -> Discord ======
 const app = express();
 app.use(express.json());
+
+// (opcional) health check
+app.get('/', (_req, res) => res.status(200).send('OK'));
 
 app.post('/push-order', async (req, res) => {
   try {
