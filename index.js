@@ -254,41 +254,44 @@ async function ephemeralAck(interaction, text) {
 client.on('interactionCreate', async (interaction) => {
   try {
     // ===== Slash Commands =====
-    if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === 'ping') {
-        // Evita timeout
-        await interaction.deferReply({ flags: InteractionResponseFlags.Ephemeral });
-        await interaction.editReply({ content: '🏓 Pong!' });
-        return;
-      }
+if (interaction.isChatInputCommand()) {
 
-      if (interaction.commandName === 'pedido') {
-        // Evita "O aplicativo não respondeu"
-        await interaction.deferReply(); // resposta pública no canal
+  // SEMPRE defer
+  await interaction.deferReply({ flags: InteractionResponseFlags.Ephemeral });
 
-        const state = readState();
+  if (interaction.commandName === 'ping') {
+    await interaction.editReply('🏓 Pong!');
+    return;
+  }
 
-        // pedido demo
-        const pedido = '5905';
-        const cliente = 'João';
-        const items = Array.from({ length: 12 }, (_, i) => ({
-          nome: `Produto ${i + 1}`,
-          qtd: i % 2 ? 2 : 1,
-        }));
+  if (interaction.commandName === 'pedido') {
+    const state = readState();
 
-        const pedidoKey = buildPedidoKey(pedido);
-        state[pedidoKey] = { pedido, cliente, items, page: 1, statusByIndex: {} };
-        writeState(state);
+    const pedido = '5905';
+    const cliente = 'João';
+    const items = Array.from({ length: 12 }, (_, i) => ({
+      nome: `Produto ${i + 1}`,
+      qtd: i % 2 ? 2 : 1,
+    }));
 
-        await interaction.editReply({
-          content: buildMessageContent(state, pedidoKey),
-          components: buildComponents(state, pedidoKey),
-        });
-        return;
-      }
+    const pedidoKey = buildPedidoKey(pedido);
+    state[pedidoKey] = {
+      pedido,
+      cliente,
+      items,
+      page: 1,
+      statusByIndex: {},
+    };
 
-      return;
-    }
+    writeState(state);
+
+    await interaction.editReply({
+      content: buildMessageContent(state, pedidoKey),
+      components: buildComponents(state, pedidoKey),
+    });
+    return;
+  }
+}
 
     // ===== Buttons =====
     if (interaction.isButton()) {
