@@ -1,9 +1,9 @@
 require("dotenv").config();
+
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
 
 // ===== Render needs an open port for Web Service =====
 const http = require("http");
-
 const PORT = process.env.PORT || 3000;
 
 http
@@ -15,10 +15,6 @@ http
     console.log("HTTP server listening on", PORT);
   });
 // ====================================================
-
-// index.js — Discord bot + Google Sheets sync (PENDENTE)
-// Node 18+
-// discord.js v14+
 
 const {
   Client,
@@ -37,7 +33,9 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID; // opcional
 const CHANNEL_ID = process.env.CHANNEL_ID; // canal fixo para postar
+
 const AUTO_SYNC_MINUTES = Number(process.env.AUTO_SYNC_MINUTES || "0"); // 0 = desliga
+const AUTO_CLEANUP_MINUTES = Number(process.env.AUTO_CLEANUP_MINUTES || "0"); // 0 = desliga
 
 const SHEETS_API_URL = process.env.SHEETS_API_URL;
 const SHEETS_API_KEY = process.env.SHEETS_API_KEY;
@@ -63,7 +61,11 @@ const client = new Client({
 async function sheetsGet(action) {
   const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(SHEETS_API_KEY)}`;
   const res = await fetch(url, { method: "GET" });
-  const data = await res.json().catch(() => ({}));
+
+  const text = await res.text();
+  let data = {};
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets GET failed: ${res.status} ${JSON.stringify(data)}`);
   }
@@ -76,11 +78,35 @@ async function sheetsPost(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...payload, key: SHEETS_API_KEY })
   });
-  const data = await res.json().catch(() => ({}));
+
+  const text = await res.text();
+  let data = {};
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets POST failed: ${res.status} ${JSON.stringify(data)}`);
   }
   return data;
+}
+
+// ======= Helpers (Discord delete via REST) =======
+async function deleteDiscordMessageById(messageId) {
+  // Usa a API do Discord direto (não precisa intents de mensagens)
+  const url = `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages/${messageId}`;
+
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: { Authorization: `Bot ${DISCORD_TOKEN}` }
+  });
+
+  // 204 = apagou
+  if (res.status === 204) return { ok: true, status: 204 };
+
+  // 404 = já não existe -> consideramos ok para não travar a limpeza
+  if (res.status === 404) return { ok: true, status: 404 };
+
+  const body = await res.text().catch(() => "");
+  return { ok: false, status: res.status, body };
 }
 
 // ======= UI (Pedido) =======
@@ -96,7 +122,6 @@ function buildOrderEmbed(order, page = 0) {
     const n = start + idx + 1;
     const qtd = it.qtd ? ` x${it.qtd}` : "";
 
-    // Quadradinho por status
     const st = String(it.status || "").toUpperCase().trim();
     const box = st === "TENHO" ? "🟩" : st === "FALTA" ? "🟥" : "⬜";
 
@@ -122,7 +147,6 @@ function buildOrderComponents(order, page = 0) {
   const start = safePage * PAGE_SIZE;
   const slice = order.items.slice(start, start + PAGE_SIZE);
 
-  // Linha de botões por item (TENHO / FALTA)
   const rows = [];
 
   for (let i = 0; i < slice.length; i++) {
@@ -143,7 +167,6 @@ function buildOrderComponents(order, page = 0) {
     );
   }
 
-  // Linha de navegação + "todos desta página"
   const nav = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`pg:prev:${order.pedido}:${safePage}`)
@@ -172,17 +195,21 @@ function buildOrderComponents(order, page = 0) {
   return rows;
 }
 
-// Estado mínimo em memória (pra paginação sem reconsultar planilha a cada clique)
-const orderCache = new Map(); // key: pedido -> orderObject
+const orderCache = new Map(); // pedido -> orderObject
 
 // ======= Commands =======
 const commands = [
   new SlashCommandBuilder()
     .setName("ping")
     .setDescription("Testa o bot"),
+
   new SlashCommandBuilder()
     .setName("sync")
     .setDescription("Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."),
+
+  new SlashCommandBuilder()
+    .setName("limpar_confirmados")
+    .setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM.")
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -196,7 +223,7 @@ async function registerCommands() {
   }
 }
 
-// Evita duplicar se o loop rodar de novo enquanto ainda está postando
+// ======= AUTO SYNC =======
 let isAutoSyncRunning = false;
 
 async function autoSyncOnce() {
@@ -221,16 +248,13 @@ async function autoSyncOnce() {
     let sent = 0;
 
     for (const order of orders) {
-      // Cache para paginação e botões
       orderCache.set(String(order.pedido), order);
 
       const embed = buildOrderEmbed(order, 0);
       const components = buildOrderComponents(order, 0);
 
-      // Posta no canal fixo
       const msg = await channel.send({ embeds: [embed], components });
 
-      // Salva MessageId na planilha (para não duplicar no próximo ciclo)
       await sheetsPost({
         action: "set_message_id",
         pedido: String(order.pedido),
@@ -253,32 +277,84 @@ function startAutoSync() {
     console.log("AUTO_SYNC: disabled (AUTO_SYNC_MINUTES <= 0).");
     return;
   }
-
   const ms = AUTO_SYNC_MINUTES * 60 * 1000;
   console.log(`AUTO_SYNC: enabled every ${AUTO_SYNC_MINUTES} minute(s). Channel: ${CHANNEL_ID}`);
-
-  // roda uma vez ao subir
   autoSyncOnce();
-
-  // roda continuamente
   setInterval(autoSyncOnce, ms);
 }
 
+// ======= CLEANUP CONFIRMADOS (PASSO 3.1) =======
+let isCleanupRunning = false;
+
+async function cleanupConfirmedOnce() {
+  if (isCleanupRunning) return;
+  isCleanupRunning = true;
+
+  try {
+    // precisa existir no Apps Script:
+    // GET ?action=list_confirmed&key=...
+    const data = await sheetsGet("list_confirmed");
+    const orders = data.orders || [];
+
+    if (!orders.length) {
+      console.log("CLEANUP: no confirmed orders to delete.");
+      return { deletedDiscord: 0, deletedRows: 0, total: 0 };
+    }
+
+    let deletedDiscord = 0;
+    let deletedRows = 0;
+
+    for (const o of orders) {
+      const messageId = String(o.discordMessageId || o.messageId || "").trim();
+      if (!messageId) continue;
+
+      // 1) apaga no Discord
+      const del = await deleteDiscordMessageById(messageId);
+      if (!del.ok) {
+        console.error("CLEANUP: failed to delete discord message", messageId, del);
+        continue; // não apaga da planilha se não conseguiu apagar no Discord
+      }
+
+      deletedDiscord++;
+
+      // 2) apaga as linhas na planilha pelo messageId
+      // precisa existir no Apps Script:
+      // POST {action:"delete_order_by_message_id", messageId, key}
+      const r = await sheetsPost({ action: "delete_order_by_message_id", messageId });
+      deletedRows += Number(r.deletedRows || 0);
+    }
+
+    console.log(`CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`);
+    return { deletedDiscord, deletedRows, total: orders.length };
+  } catch (err) {
+    console.error("CLEANUP error:", err);
+    return { error: String(err?.message || err) };
+  } finally {
+    isCleanupRunning = false;
+  }
+}
+
+function startAutoCleanup() {
+  if (!AUTO_CLEANUP_MINUTES || AUTO_CLEANUP_MINUTES <= 0) {
+    console.log("CLEANUP: disabled (AUTO_CLEANUP_MINUTES <= 0).");
+    return;
+  }
+  const ms = AUTO_CLEANUP_MINUTES * 60 * 1000;
+  console.log(`CLEANUP: enabled every ${AUTO_CLEANUP_MINUTES} minute(s).`);
+  cleanupConfirmedOnce();
+  setInterval(cleanupConfirmedOnce, ms);
+}
+
+// ======= READY =======
 client.once("ready", () => {
   console.log(`🤖 Bot online como: ${client.user.tag}`);
   startAutoSync();
+  startAutoCleanup();
 });
 
 // ======= Interaction Handler =======
 client.on("interactionCreate", async (interaction) => {
-  console.log(
-  "INTERACTION:",
-  interaction.isChatInputCommand() ? `slash:${interaction.commandName}` :
-  interaction.isButton() ? `button:${interaction.customId}` :
-  interaction.type
-);
   try {
-    // Slash commands
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "ping") {
         return interaction.reply({ content: "pong ✅", flags: MessageFlags.Ephemeral });
@@ -287,7 +363,6 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.commandName === "sync") {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-        // Busca pendentes
         const data = await sheetsGet("list_pending");
         const orders = data.orders || [];
 
@@ -297,16 +372,13 @@ client.on("interactionCreate", async (interaction) => {
 
         let sent = 0;
         for (const order of orders) {
-          // Cache para paginação e botões
           orderCache.set(String(order.pedido), order);
 
           const embed = buildOrderEmbed(order, 0);
           const components = buildOrderComponents(order, 0);
 
-          // Posta no canal onde o comando foi usado
           const msg = await interaction.channel.send({ embeds: [embed], components });
 
-          // Grava MessageId na planilha (pra não duplicar)
           await sheetsPost({
             action: "set_message_id",
             pedido: String(order.pedido),
@@ -316,28 +388,40 @@ client.on("interactionCreate", async (interaction) => {
           sent++;
         }
 
-        return interaction.editReply(`✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) da planilha para este canal.`);
+        return interaction.editReply(`✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) para este canal.`);
+      }
+
+      if (interaction.commandName === "limpar_confirmados") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const result = await cleanupConfirmedOnce();
+        if (result?.error) {
+          return interaction.editReply(`❌ Erro: ${result.error}`);
+        }
+        return interaction.editReply(
+          `✅ Limpeza concluída.\n` +
+          `• Pedidos processados: ${result.total}\n` +
+          `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
+          `• Linhas removidas da planilha: ${result.deletedRows}`
+        );
       }
     }
 
     // Buttons
     if (interaction.isButton()) {
-      const id = interaction.customId || "";
-
-      // Sempre responder rápido
       await interaction.deferUpdate();
 
+      const id = interaction.customId || "";
       const parts = id.split(":");
       const type = parts[0];
 
-      // Paginação
       if (type === "pg") {
         const action = parts[1]; // prev | next | tenho_all | falta_all
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
 
         const order = orderCache.get(String(pedido));
-        if (!order) return; // se reiniciou o bot, cache some; nesse caso você pode rodar /sync de novo
+        if (!order) return;
 
         if (action === "prev" || action === "next") {
           const nextPage = action === "prev" ? page - 1 : page + 1;
@@ -346,7 +430,6 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.message.edit({ embeds: [embed], components });
         }
 
-        // Marcar todos da página
         const status = action === "tenho_all" ? "TENHO" : "FALTA";
         const start = page * PAGE_SIZE;
         const slice = order.items.slice(start, start + PAGE_SIZE);
@@ -366,18 +449,16 @@ client.on("interactionCreate", async (interaction) => {
           it.status = status;
         }
 
-        // Atualiza só a mensagem (visual pode continuar igual; se você quiser, posso colocar ✅/❌ no texto)
         const embed = buildOrderEmbed(order, page);
         const components = buildOrderComponents(order, page);
         return interaction.message.edit({ embeds: [embed], components });
       }
 
-      // Item individual
       if (type === "it") {
         const status = parts[1] === "tenho" ? "TENHO" : "FALTA";
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
-        const itemKey = parts.slice(4).join(":"); // caso tenha ":" no key
+        const itemKey = parts.slice(4).join(":");
 
         const order = orderCache.get(String(pedido));
         if (!order) return;
@@ -393,7 +474,6 @@ client.on("interactionCreate", async (interaction) => {
           conferidoEmISO: nowISO
         });
 
-        // Atualiza no cache
         const it = order.items.find(x => String(x.itemKey) === String(itemKey));
         if (it) it.status = status;
 
@@ -404,8 +484,6 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (err) {
     console.error("Interaction error:", err);
-
-    // Tenta responder sem quebrar (evita "Unknown interaction")
     try {
       if (interaction.isRepliable()) {
         if (interaction.deferred) {
