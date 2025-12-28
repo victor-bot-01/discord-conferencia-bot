@@ -1,6 +1,21 @@
 require("dotenv").config();
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
 
+// ===== Render needs an open port for Web Service =====
+const http = require("http");
+
+const PORT = process.env.PORT || 3000;
+
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+  })
+  .listen(PORT, () => {
+    console.log("HTTP server listening on", PORT);
+  });
+// ====================================================
+
 // index.js — Discord bot + Google Sheets sync (PENDENTE)
 // Node 18+
 // discord.js v14+
