@@ -1,9 +1,10 @@
-// index.js
-// Discord bot (discord.js v14) + Render/HTTP keep-alive
-// Comandos: /ping, /pedido
-// Interface limpa: botões NÃO geram mensagens “ocultas” no chat (usa deferUpdate)
-
 require("dotenv").config();
+console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
+
+// index.js — Discord bot + Google Sheets sync (PENDENTE)
+// Node 18+
+// discord.js v14+
+
 const {
   Client,
   GatewayIntentBits,
@@ -14,345 +15,395 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  MessageFlags
 } = require("discord.js");
 
-const express = require("express");
-
-// =======================
-// 0) ENV
-// =======================
-const TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID; // opcional (recomendado p/ registrar rápido)
+const GUILD_ID = process.env.GUILD_ID; // opcional
+const CHANNEL_ID = process.env.CHANNEL_ID; // canal fixo para postar
+const AUTO_SYNC_MINUTES = Number(process.env.AUTO_SYNC_MINUTES || "0"); // 0 = desliga
 
-if (!TOKEN || !CLIENT_ID) {
-  console.error(
-    "❌ Faltam variáveis .env: DISCORD_TOKEN e/ou CLIENT_ID. (GUILD_ID é opcional)"
-  );
+const SHEETS_API_URL = process.env.SHEETS_API_URL;
+const SHEETS_API_KEY = process.env.SHEETS_API_KEY;
+
+if (!DISCORD_TOKEN || !CLIENT_ID) {
+  console.error("Missing DISCORD_TOKEN or CLIENT_ID");
+  process.exit(1);
+}
+if (!SHEETS_API_URL || !SHEETS_API_KEY) {
+  console.error("Missing SHEETS_API_URL or SHEETS_API_KEY");
+  process.exit(1);
+}
+if (!CHANNEL_ID) {
+  console.error("Missing CHANNEL_ID");
   process.exit(1);
 }
 
-// =======================
-// 1) HTTP server (Render)
-// =======================
-const app = express();
-app.get("/", (req, res) => res.status(200).send("OK"));
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`✅ HTTP OK em http://localhost:${PORT}`));
-
-// =======================
-// 2) Discord client
-// =======================
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds]
 });
 
-// =======================
-// 3) Estado em memória
-// =======================
-// messageId -> state
-// state = { orderId, customerName, page, perPage, products: [{name, qty, status:null|'TENHO'|'FALTA'}] }
-const ordersByMessageId = new Map();
-
-// =======================
-// 4) Slash commands
-// =======================
-const commands = [
-  new SlashCommandBuilder().setName("ping").setDescription("Testa o bot."),
-  new SlashCommandBuilder()
-    .setName("pedido")
-    .setDescription("Cria uma mensagem de conferência de pedido (demo)."),
-].map((c) => c.toJSON());
-
-async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
-
-  try {
-    if (GUILD_ID) {
-      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-        body: commands,
-      });
-      console.log("✅ Comandos /ping e /pedido registrados (GUILD).");
-    } else {
-      await rest.put(Routes.applicationCommands(CLIENT_ID), {
-        body: commands,
-      });
-      console.log("✅ Comandos /ping e /pedido registrados (GLOBAL).");
-    }
-  } catch (err) {
-    console.error("❌ Erro registrando comandos:", err);
+// ======= Helpers (Sheets API) =======
+async function sheetsGet(action) {
+  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(SHEETS_API_KEY)}`;
+  const res = await fetch(url, { method: "GET" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(`Sheets GET failed: ${res.status} ${JSON.stringify(data)}`);
   }
+  return data;
 }
 
-// =======================
-// 5) Helpers de UI
-// =======================
-function computeOrderStatus(products) {
-  const allMarked = products.every((p) => p.status === "TENHO" || p.status === "FALTA");
-  return allMarked ? "COMPLETO" : "PENDENTE";
-}
-
-function statusEmoji(status) {
-  if (status === "TENHO") return "✅";
-  if (status === "FALTA") return "❌";
-  return "⬜";
-}
-
-function buildEmbed(state) {
-  const totalPages = Math.max(1, Math.ceil(state.products.length / state.perPage));
-  const page = Math.min(Math.max(0, state.page), totalPages - 1);
-
-  const start = page * state.perPage;
-  const end = Math.min(start + state.perPage, state.products.length);
-  const pageItems = state.products.slice(start, end);
-
-  const lines = [];
-  for (let i = start; i < end; i++) {
-    const p = state.products[i];
-    lines.push(`${statusEmoji(p.status)} **${i + 1}. ${p.name}** x${p.qty}`);
+async function sheetsPost(payload) {
+  const res = await fetch(SHEETS_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...payload, key: SHEETS_API_KEY })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(`Sheets POST failed: ${res.status} ${JSON.stringify(data)}`);
   }
+  return data;
+}
 
-  const orderStatus = computeOrderStatus(state.products);
+// ======= UI (Pedido) =======
+const PAGE_SIZE = 4;
 
-  const embed = new EmbedBuilder()
+function buildOrderEmbed(order, page = 0) {
+  const totalPages = Math.max(1, Math.ceil(order.items.length / PAGE_SIZE));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const start = safePage * PAGE_SIZE;
+  const slice = order.items.slice(start, start + PAGE_SIZE);
+
+  const lines = slice.map((it, idx) => {
+    const n = start + idx + 1;
+    const qtd = it.qtd ? ` x${it.qtd}` : "";
+
+    // Quadradinho por status
+    const st = String(it.status || "").toUpperCase().trim();
+    const box = st === "TENHO" ? "🟩" : st === "FALTA" ? "🟥" : "⬜";
+
+    return `${box} ${n}. ${it.produto}${qtd}`;
+  });
+
+  return new EmbedBuilder()
     .setTitle("📦 Conferência de Pedido")
     .setDescription(
-      [
-        `**Pedido:** ${state.orderId}`,
-        `**Cliente:** ${state.customerName}`,
-        `**Status do pedido:** **${orderStatus}**`,
-        "",
-        "**Produtos:**",
-        lines.join("\n"),
-        "",
-        `Página **${page + 1}/${totalPages}**`,
-      ].join("\n")
-    )
-    .setFooter({ text: "Marque item por item ou use os botões da página." });
-
-  return embed;
+      `**Pedido:** #${order.pedido}\n` +
+      `**Cliente:** ${order.cliente || "-"}\n\n` +
+      `**Produtos:**\n${lines.join("\n")}\n\n` +
+      `**Status do pedido:** **PENDENTE**\n` +
+      `**Página:** ${safePage + 1}/${totalPages}\n` +
+      `Marque item por item ou use os botões desta página.`
+    );
 }
 
-function buildComponents(messageId, state) {
-  const totalPages = Math.max(1, Math.ceil(state.products.length / state.perPage));
-  const page = Math.min(Math.max(0, state.page), totalPages - 1);
+function buildOrderComponents(order, page = 0) {
+  const totalPages = Math.max(1, Math.ceil(order.items.length / PAGE_SIZE));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const start = safePage * PAGE_SIZE;
+  const slice = order.items.slice(start, start + PAGE_SIZE);
 
-  const start = page * state.perPage;
-  const end = Math.min(start + state.perPage, state.products.length);
-
+  // Linha de botões por item (TENHO / FALTA)
   const rows = [];
 
-  // 1 row por produto (2 botões por linha)
-  for (let i = start; i < end; i++) {
-    const p = state.products[i];
+  for (let i = 0; i < slice.length; i++) {
+    const it = slice[i];
+    const labelN = start + i + 1;
 
-    const tenhoBtn = new ButtonBuilder()
-      .setCustomId(`tenho:${i}`)
-      .setLabel(`Tenho ${i + 1}`)
-      .setStyle(ButtonStyle.Success);
-
-    const faltaBtn = new ButtonBuilder()
-      .setCustomId(`falta:${i}`)
-      .setLabel(`Falta ${i + 1}`)
-      .setStyle(ButtonStyle.Danger);
-
-    // Se quiser “travar” quando já marcado:
-    if (p.status === "TENHO") tenhoBtn.setDisabled(true);
-    if (p.status === "FALTA") faltaBtn.setDisabled(true);
-
-    rows.push(new ActionRowBuilder().addComponents(tenhoBtn, faltaBtn));
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`it:tenho:${order.pedido}:${safePage}:${it.itemKey}`)
+          .setLabel(`Tenho (Prod ${labelN})`)
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`it:falta:${order.pedido}:${safePage}:${it.itemKey}`)
+          .setLabel(`Falta (Prod ${labelN})`)
+          .setStyle(ButtonStyle.Danger),
+      )
+    );
   }
 
-  // Linha de navegação + ações por página
-  const prevBtn = new ButtonBuilder()
-    .setCustomId(`prev`)
-    .setLabel("⬅️ Página anterior")
-    .setStyle(ButtonStyle.Secondary)
-    .setDisabled(page <= 0);
+  // Linha de navegação + "todos desta página"
+  const nav = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`pg:prev:${order.pedido}:${safePage}`)
+      .setLabel("⬅ Página anterior")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(safePage === 0),
 
-  const nextBtn = new ButtonBuilder()
-    .setCustomId(`next`)
-    .setLabel("Próxima página ➡️")
-    .setStyle(ButtonStyle.Secondary)
-    .setDisabled(page >= totalPages - 1);
+    new ButtonBuilder()
+      .setCustomId(`pg:next:${order.pedido}:${safePage}`)
+      .setLabel("Próxima página ➡")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(safePage >= totalPages - 1),
 
-  const tenhoPageBtn = new ButtonBuilder()
-    .setCustomId(`tenho_page`)
-    .setLabel("Tenho todos desta página")
-    .setStyle(ButtonStyle.Success);
+    new ButtonBuilder()
+      .setCustomId(`pg:tenho_all:${order.pedido}:${safePage}`)
+      .setLabel("Tenho todos desta página")
+      .setStyle(ButtonStyle.Success),
 
-  const faltaPageBtn = new ButtonBuilder()
-    .setCustomId(`falta_page`)
-    .setLabel("Falta todos desta página")
-    .setStyle(ButtonStyle.Danger);
-
-  rows.push(
-    new ActionRowBuilder().addComponents(prevBtn, nextBtn, tenhoPageBtn, faltaPageBtn)
+    new ButtonBuilder()
+      .setCustomId(`pg:falta_all:${order.pedido}:${safePage}`)
+      .setLabel("Falta todos desta página")
+      .setStyle(ButtonStyle.Danger),
   );
 
-  // Limite do Discord: 5 linhas no máximo.
-  // Com perPage=4 => 4 linhas produtos + 1 navegação = 5 (ok).
-  return rows.slice(0, 5);
+  rows.push(nav);
+  return rows;
 }
 
-function buildMessagePayload(messageId, state) {
-  return {
-    embeds: [buildEmbed(state)],
-    components: buildComponents(messageId, state),
-  };
+// Estado mínimo em memória (pra paginação sem reconsultar planilha a cada clique)
+const orderCache = new Map(); // key: pedido -> orderObject
+
+// ======= Commands =======
+const commands = [
+  new SlashCommandBuilder()
+    .setName("ping")
+    .setDescription("Testa o bot"),
+  new SlashCommandBuilder()
+    .setName("sync")
+    .setDescription("Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."),
+].map(c => c.toJSON());
+
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+  if (GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    console.log("✅ Commands registered (guild).");
+  } else {
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log("✅ Commands registered (global).");
+  }
 }
 
-// =======================
-// 6) Criar pedido demo
-// =======================
-function makeDemoOrder() {
-  // Ajuste aqui para puxar dados reais depois
-  const products = Array.from({ length: 12 }).map((_, idx) => ({
-    name: `Produto ${idx + 1}`,
-    qty: (idx % 2) + 1,
-    status: null,
-  }));
+// Evita duplicar se o loop rodar de novo enquanto ainda está postando
+let isAutoSyncRunning = false;
 
-  return {
-    orderId: `#${Math.floor(100000 + Math.random() * 900000)}`,
-    customerName: "Cliente João",
-    page: 0,
-    perPage: 4,
-    products,
-  };
-}
+async function autoSyncOnce() {
+  if (isAutoSyncRunning) return;
+  isAutoSyncRunning = true;
 
-// =======================
-// 7) Interactions
-// =======================
-client.on("interactionCreate", async (interaction) => {
   try {
-    // -------------------
-    // SLASH COMMANDS
-    // -------------------
-    if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === "ping") {
-        // Para evitar timeout em cold start: sempre defer
-        await interaction.deferReply({ ephemeral: true });
-        await interaction.editReply("🏓 Pong! Bot online.");
-        return;
-      }
-
-      if (interaction.commandName === "pedido") {
-        // Mensagem no canal (não ephemeral)
-        await interaction.deferReply();
-
-        const state = makeDemoOrder();
-
-        // Envia a mensagem “principal” via editReply (vira a própria mensagem do comando)
-        const tempPayload = buildMessagePayload("temp", state);
-        const msg = await interaction.editReply(tempPayload);
-
-        // Agora temos messageId real
-        ordersByMessageId.set(msg.id, state);
-
-        // Re-edita com customIds já ok (não precisa, mas mantém consistente)
-        const realPayload = buildMessagePayload(msg.id, state);
-        await msg.edit(realPayload);
-
-        return;
-      }
-    }
-
-    // -------------------
-    // BUTTONS
-    // -------------------
-    if (interaction.isButton()) {
-      const messageId = interaction.message?.id;
-      const state = ordersByMessageId.get(messageId);
-
-      // IMPORTANTÍSSIMO: não poluir chat.
-      // Isso confirma o clique sem mandar mensagens.
-      await interaction.deferUpdate();
-
-      if (!state) {
-        // Caso a mensagem seja antiga e o bot tenha reiniciado (memória perdeu)
-        // Envia só para quem clicou (não polui)
-        await interaction.followUp({
-          content:
-            "⚠️ Não encontrei esse pedido na memória (o bot pode ter reiniciado). Rode /pedido novamente.",
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const id = interaction.customId;
-
-      // Navegação
-      if (id === "prev") state.page = Math.max(0, state.page - 1);
-      if (id === "next") {
-        const totalPages = Math.max(1, Math.ceil(state.products.length / state.perPage));
-        state.page = Math.min(totalPages - 1, state.page + 1);
-      }
-
-      // Ações por item
-      if (id.startsWith("tenho:")) {
-        const idx = Number(id.split(":")[1]);
-        if (!Number.isNaN(idx) && state.products[idx]) state.products[idx].status = "TENHO";
-      }
-
-      if (id.startsWith("falta:")) {
-        const idx = Number(id.split(":")[1]);
-        if (!Number.isNaN(idx) && state.products[idx]) state.products[idx].status = "FALTA";
-      }
-
-      // Ações por página
-      if (id === "tenho_page" || id === "falta_page") {
-        const totalPages = Math.max(1, Math.ceil(state.products.length / state.perPage));
-        const page = Math.min(Math.max(0, state.page), totalPages - 1);
-        const start = page * state.perPage;
-        const end = Math.min(start + state.perPage, state.products.length);
-
-        for (let i = start; i < end; i++) {
-          state.products[i].status = id === "tenho_page" ? "TENHO" : "FALTA";
-        }
-      }
-
-      // Salva estado
-      ordersByMessageId.set(messageId, state);
-
-      // Atualiza só a mensagem principal (sem spam)
-      const payload = buildMessagePayload(messageId, state);
-      await interaction.message.edit(payload);
-
+    const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
+    if (!channel || !channel.isTextBased()) {
+      console.error("AUTO_SYNC: Channel not found or not text-based:", CHANNEL_ID);
       return;
     }
-  } catch (err) {
-    console.error("❌ Erro em interactionCreate:", err);
 
-    // Tenta não deixar “interação falhou”
+    const data = await sheetsGet("list_pending");
+    const orders = data.orders || [];
+
+    if (!orders.length) {
+      console.log("AUTO_SYNC: no pending orders.");
+      return;
+    }
+
+    let sent = 0;
+
+    for (const order of orders) {
+      // Cache para paginação e botões
+      orderCache.set(String(order.pedido), order);
+
+      const embed = buildOrderEmbed(order, 0);
+      const components = buildOrderComponents(order, 0);
+
+      // Posta no canal fixo
+      const msg = await channel.send({ embeds: [embed], components });
+
+      // Salva MessageId na planilha (para não duplicar no próximo ciclo)
+      await sheetsPost({
+        action: "set_message_id",
+        pedido: String(order.pedido),
+        messageId: String(msg.id)
+      });
+
+      sent++;
+    }
+
+    console.log(`AUTO_SYNC: sent ${sent} order(s).`);
+  } catch (err) {
+    console.error("AUTO_SYNC error:", err);
+  } finally {
+    isAutoSyncRunning = false;
+  }
+}
+
+function startAutoSync() {
+  if (!AUTO_SYNC_MINUTES || AUTO_SYNC_MINUTES <= 0) {
+    console.log("AUTO_SYNC: disabled (AUTO_SYNC_MINUTES <= 0).");
+    return;
+  }
+
+  const ms = AUTO_SYNC_MINUTES * 60 * 1000;
+  console.log(`AUTO_SYNC: enabled every ${AUTO_SYNC_MINUTES} minute(s). Channel: ${CHANNEL_ID}`);
+
+  // roda uma vez ao subir
+  autoSyncOnce();
+
+  // roda continuamente
+  setInterval(autoSyncOnce, ms);
+}
+
+client.once("ready", () => {
+  console.log(`🤖 Bot online como: ${client.user.tag}`);
+  startAutoSync();
+});
+
+// ======= Interaction Handler =======
+client.on("interactionCreate", async (interaction) => {
+  console.log(
+  "INTERACTION:",
+  interaction.isChatInputCommand() ? `slash:${interaction.commandName}` :
+  interaction.isButton() ? `button:${interaction.customId}` :
+  interaction.type
+);
+  try {
+    // Slash commands
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "ping") {
+        return interaction.reply({ content: "pong ✅", flags: MessageFlags.Ephemeral });
+      }
+
+      if (interaction.commandName === "sync") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        // Busca pendentes
+        const data = await sheetsGet("list_pending");
+        const orders = data.orders || [];
+
+        if (!orders.length) {
+          return interaction.editReply("Nada para sincronizar: nenhum pedido PENDENTE sem DiscordMessageId.");
+        }
+
+        let sent = 0;
+        for (const order of orders) {
+          // Cache para paginação e botões
+          orderCache.set(String(order.pedido), order);
+
+          const embed = buildOrderEmbed(order, 0);
+          const components = buildOrderComponents(order, 0);
+
+          // Posta no canal onde o comando foi usado
+          const msg = await interaction.channel.send({ embeds: [embed], components });
+
+          // Grava MessageId na planilha (pra não duplicar)
+          await sheetsPost({
+            action: "set_message_id",
+            pedido: String(order.pedido),
+            messageId: String(msg.id)
+          });
+
+          sent++;
+        }
+
+        return interaction.editReply(`✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) da planilha para este canal.`);
+      }
+    }
+
+    // Buttons
+    if (interaction.isButton()) {
+      const id = interaction.customId || "";
+
+      // Sempre responder rápido
+      await interaction.deferUpdate();
+
+      const parts = id.split(":");
+      const type = parts[0];
+
+      // Paginação
+      if (type === "pg") {
+        const action = parts[1]; // prev | next | tenho_all | falta_all
+        const pedido = parts[2];
+        const page = parseInt(parts[3] || "0", 10) || 0;
+
+        const order = orderCache.get(String(pedido));
+        if (!order) return; // se reiniciou o bot, cache some; nesse caso você pode rodar /sync de novo
+
+        if (action === "prev" || action === "next") {
+          const nextPage = action === "prev" ? page - 1 : page + 1;
+          const embed = buildOrderEmbed(order, nextPage);
+          const components = buildOrderComponents(order, nextPage);
+          return interaction.message.edit({ embeds: [embed], components });
+        }
+
+        // Marcar todos da página
+        const status = action === "tenho_all" ? "TENHO" : "FALTA";
+        const start = page * PAGE_SIZE;
+        const slice = order.items.slice(start, start + PAGE_SIZE);
+
+        const who = interaction.user?.username || "usuario";
+        const nowISO = new Date().toISOString();
+
+        for (const it of slice) {
+          if (!it.itemKey) continue;
+          await sheetsPost({
+            action: "set_item_status",
+            itemKey: String(it.itemKey),
+            status,
+            conferidoPor: who,
+            conferidoEmISO: nowISO
+          });
+          it.status = status;
+        }
+
+        // Atualiza só a mensagem (visual pode continuar igual; se você quiser, posso colocar ✅/❌ no texto)
+        const embed = buildOrderEmbed(order, page);
+        const components = buildOrderComponents(order, page);
+        return interaction.message.edit({ embeds: [embed], components });
+      }
+
+      // Item individual
+      if (type === "it") {
+        const status = parts[1] === "tenho" ? "TENHO" : "FALTA";
+        const pedido = parts[2];
+        const page = parseInt(parts[3] || "0", 10) || 0;
+        const itemKey = parts.slice(4).join(":"); // caso tenha ":" no key
+
+        const order = orderCache.get(String(pedido));
+        if (!order) return;
+
+        const who = interaction.user?.username || "usuario";
+        const nowISO = new Date().toISOString();
+
+        await sheetsPost({
+          action: "set_item_status",
+          itemKey: String(itemKey),
+          status,
+          conferidoPor: who,
+          conferidoEmISO: nowISO
+        });
+
+        // Atualiza no cache
+        const it = order.items.find(x => String(x.itemKey) === String(itemKey));
+        if (it) it.status = status;
+
+        const embed = buildOrderEmbed(order, page);
+        const components = buildOrderComponents(order, page);
+        return interaction.message.edit({ embeds: [embed], components });
+      }
+    }
+  } catch (err) {
+    console.error("Interaction error:", err);
+
+    // Tenta responder sem quebrar (evita "Unknown interaction")
     try {
       if (interaction.isRepliable()) {
         if (interaction.deferred) {
-          await interaction.followUp({
-            content: "❌ Ocorreu um erro interno. Veja os logs no Render.",
-            ephemeral: true,
-          });
+          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
         } else {
-          await interaction.reply({
-            content: "❌ Ocorreu um erro interno. Veja os logs no Render.",
-            ephemeral: true,
-          });
+          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
         }
       }
     } catch (_) {}
   }
 });
 
-// =======================
-// 8) Ready
-// =======================
-client.once("ready", () => {
-  console.log(`✅ Bot online como: ${client.user.tag}`);
-});
-
-// Start
+// ======= Boot =======
 (async () => {
   await registerCommands();
-  await client.login(TOKEN);
+  await client.login(DISCORD_TOKEN);
 })();
