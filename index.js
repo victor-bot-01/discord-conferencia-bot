@@ -107,6 +107,7 @@ function buildOrderEmbed(order, page = 0) {
     .setTitle("📦 Conferência de Pedido")
     .setDescription(
       `**Pedido:** #${order.pedido}\n` +
+      `**Marketplace:** ${order.marketplace || "-"}\n` +
       `**Cliente:** ${order.cliente || "-"}\n\n` +
       `**Produtos:**\n${lines.join("\n")}\n\n` +
       `**Status do pedido:** **PENDENTE**\n` +
