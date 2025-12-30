@@ -1,54 +1,6 @@
 require("dotenv").config();
 
-// ======= BOOT (RETRY + DIAG SEM MATAR O SERVIÇO) =======
-async function diagDiscord() {
-  try {
-    const r = await fetch("https://discord.com/api/v10/users/@me", {
-      headers: {
-        Authorization: `Bot ${DISCORD_TOKEN}`,
-        "User-Agent": "DiscordBot (https://example.com, 1.0)",
-        Accept: "application/json"
-      }
-    });
-    const txt = await r.text();
-    console.log("DIAG /users/@me status =", r.status, "body head =", txt.slice(0, 120));
-  } catch (e) {
-    console.error("DIAG Falha de rede/TLS:", e);
-  }
-}
-
-async function loginWithRetry() {
-  console.log("BOOT: chamando client.login...");
-
-  // tenta logar e espera no máximo 25s
-  const loginPromise = client.login(DISCORD_TOKEN);
-  const timeoutPromise = new Promise((_, rej) =>
-    setTimeout(() => rej(new Error("LOGIN TIMEOUT em 25s")), 25000)
-  );
-
-  try {
-    await Promise.race([loginPromise, timeoutPromise]);
-    console.log("✅ Login OK (promise resolveu)");
-  } catch (err) {
-    console.error("❌ Login falhou/timeout:", err?.message || err);
-    await diagDiscord();
-
-    // espera 5 minutos antes de tentar de novo (pra não ficar tomando 429)
-    console.log("⏳ Aguardando 5 minutos para tentar login novamente...");
-    setTimeout(loginWithRetry, 5 * 60 * 1000);
-  }
-}
-
-client.on("ready", () => {
-  console.log(`🤖 Bot online como: ${client.user.tag}`);
-  startAutoSync();
-  startAutoCleanup();
-});
-
-client.on("error", (e) => console.error("CLIENT ERROR:", e));
-client.on("warn", (w) => console.warn("CLIENT WARN:", w));
-
-loginWithRetry();
+console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
 
 // ===== Render needs an open port for Web Service =====
 const http = require("http");
@@ -74,9 +26,10 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  MessageFlags
+  MessageFlags,
 } = require("discord.js");
 
+// ======= ENV =======
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID; // opcional
@@ -101,18 +54,26 @@ if (!CHANNEL_ID) {
   process.exit(1);
 }
 
+// ======= CLIENT (CRIA PRIMEIRO!) =======
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [GatewayIntentBits.Guilds],
 });
 
 // ======= Helpers (Sheets API) =======
 async function sheetsGet(action) {
-  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(SHEETS_API_KEY)}`;
+  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(
+    action
+  )}&key=${encodeURIComponent(SHEETS_API_KEY)}`;
+
   const res = await fetch(url, { method: "GET" });
 
   const text = await res.text();
   let data = {};
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
 
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets GET failed: ${res.status} ${JSON.stringify(data)}`);
@@ -124,12 +85,16 @@ async function sheetsPost(payload) {
   const res = await fetch(SHEETS_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, key: SHEETS_API_KEY })
+    body: JSON.stringify({ ...payload, key: SHEETS_API_KEY }),
   });
 
   const text = await res.text();
   let data = {};
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
 
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets POST failed: ${res.status} ${JSON.stringify(data)}`);
@@ -143,7 +108,7 @@ async function deleteDiscordMessageById(messageId) {
 
   const res = await fetch(url, {
     method: "DELETE",
-    headers: { Authorization: `Bot ${DISCORD_TOKEN}` }
+    headers: { Authorization: `Bot ${DISCORD_TOKEN}` },
   });
 
   if (res.status === 204) return { ok: true, status: 204 };
@@ -165,8 +130,10 @@ function buildOrderEmbed(order, page = 0) {
   const lines = slice.map((it, idx) => {
     const n = start + idx + 1;
     const qtd = it.qtd ? ` x${it.qtd}` : "";
+
     const st = String(it.status || "").toUpperCase().trim();
     const box = st === "TENHO" ? "🟩" : st === "FALTA" ? "🟥" : "⬜";
+
     return `${box} ${n}. ${it.produto}${qtd}`;
   });
 
@@ -174,12 +141,12 @@ function buildOrderEmbed(order, page = 0) {
     .setTitle("📦 Conferência de Pedido")
     .setDescription(
       `**Pedido:** #${order.pedido}\n` +
-      `**Marketplace:** ${order.marketplace || "-"}\n` +
-      `**Cliente:** ${order.cliente || "-"}\n\n` +
-      `**Produtos:**\n${lines.join("\n")}\n\n` +
-      `**Status do pedido:** **PENDENTE**\n` +
-      `**Página:** ${safePage + 1}/${totalPages}\n` +
-      `Marque item por item ou use os botões desta página.`
+        `**Marketplace:** ${order.marketplace || "-"}\n` +
+        `**Cliente:** ${order.cliente || "-"}\n\n` +
+        `**Produtos:**\n${lines.join("\n")}\n\n` +
+        `**Status do pedido:** **PENDENTE**\n` +
+        `**Página:** ${safePage + 1}/${totalPages}\n` +
+        `Marque item por item ou use os botões desta página.`
     );
 }
 
@@ -204,7 +171,7 @@ function buildOrderComponents(order, page = 0) {
         new ButtonBuilder()
           .setCustomId(`it:falta:${order.pedido}:${safePage}:${it.itemKey}`)
           .setLabel(`Falta (Prod ${labelN})`)
-          .setStyle(ButtonStyle.Danger),
+          .setStyle(ButtonStyle.Danger)
       )
     );
   }
@@ -230,7 +197,7 @@ function buildOrderComponents(order, page = 0) {
     new ButtonBuilder()
       .setCustomId(`pg:falta_all:${order.pedido}:${safePage}`)
       .setLabel("Falta todos desta página")
-      .setStyle(ButtonStyle.Danger),
+      .setStyle(ButtonStyle.Danger)
   );
 
   rows.push(nav);
@@ -242,14 +209,24 @@ const orderCache = new Map(); // pedido -> orderObject
 // ======= Commands =======
 const commands = [
   new SlashCommandBuilder().setName("ping").setDescription("Testa o bot"),
-  new SlashCommandBuilder().setName("sync").setDescription("Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."),
-  new SlashCommandBuilder().setName("limpar_confirmados").setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM.")
-].map(c => c.toJSON());
+
+  new SlashCommandBuilder()
+    .setName("sync")
+    .setDescription(
+      "Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."
+    ),
+
+  new SlashCommandBuilder()
+    .setName("limpar_confirmados")
+    .setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM."),
+].map((c) => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
   if (GUILD_ID) {
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
+      body: commands,
+    });
     console.log("✅ Commands registered (guild).");
   } else {
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
@@ -292,7 +269,7 @@ async function autoSyncOnce() {
       await sheetsPost({
         action: "set_message_id",
         pedido: String(order.pedido),
-        messageId: String(msg.id)
+        messageId: String(msg.id),
       });
 
       sent++;
@@ -352,7 +329,9 @@ async function cleanupConfirmedOnce() {
       deletedRows += Number(r.deletedRows || 0);
     }
 
-    console.log(`CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`);
+    console.log(
+      `CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`
+    );
     return { deletedDiscord, deletedRows, total: orders.length };
   } catch (err) {
     console.error("CLEANUP error:", err);
@@ -373,6 +352,25 @@ function startAutoCleanup() {
   setInterval(cleanupConfirmedOnce, ms);
 }
 
+// ======= READY =======
+let commandsRegistered = false;
+
+client.once("ready", async () => {
+  console.log(`🤖 Bot online como: ${client.user.tag}`);
+
+  try {
+    if (!commandsRegistered) {
+      commandsRegistered = true;
+      await registerCommands();
+    }
+  } catch (e) {
+    console.error("❌ Failed to register commands:", e);
+  }
+
+  startAutoSync();
+  startAutoCleanup();
+});
+
 // ======= Interaction Handler =======
 client.on("interactionCreate", async (interaction) => {
   try {
@@ -388,7 +386,9 @@ client.on("interactionCreate", async (interaction) => {
         const orders = data.orders || [];
 
         if (!orders.length) {
-          return interaction.editReply("Nada para sincronizar: nenhum pedido PENDENTE sem DiscordMessageId.");
+          return interaction.editReply(
+            "Nada para sincronizar: nenhum pedido PENDENTE sem DiscordMessageId."
+          );
         }
 
         let sent = 0;
@@ -403,26 +403,29 @@ client.on("interactionCreate", async (interaction) => {
           await sheetsPost({
             action: "set_message_id",
             pedido: String(order.pedido),
-            messageId: String(msg.id)
+            messageId: String(msg.id),
           });
 
           sent++;
         }
 
-        return interaction.editReply(`✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) para este canal.`);
+        return interaction.editReply(
+          `✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) para este canal.`
+        );
       }
 
       if (interaction.commandName === "limpar_confirmados") {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         const result = await cleanupConfirmedOnce();
-        if (result?.error) return interaction.editReply(`❌ Erro: ${result.error}`);
-
+        if (result?.error) {
+          return interaction.editReply(`❌ Erro: ${result.error}`);
+        }
         return interaction.editReply(
           `✅ Limpeza concluída.\n` +
-          `• Pedidos processados: ${result.total}\n` +
-          `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
-          `• Linhas removidas da planilha: ${result.deletedRows}`
+            `• Pedidos processados: ${result.total}\n` +
+            `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
+            `• Linhas removidas da planilha: ${result.deletedRows}`
         );
       }
     }
@@ -463,7 +466,7 @@ client.on("interactionCreate", async (interaction) => {
             itemKey: String(it.itemKey),
             status,
             conferidoPor: who,
-            conferidoEmISO: nowISO
+            conferidoEmISO: nowISO,
           });
           it.status = status;
         }
@@ -490,10 +493,10 @@ client.on("interactionCreate", async (interaction) => {
           itemKey: String(itemKey),
           status,
           conferidoPor: who,
-          conferidoEmISO: nowISO
+          conferidoEmISO: nowISO,
         });
 
-        const it = order.items.find(x => String(x.itemKey) === String(itemKey));
+        const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
         if (it) it.status = status;
 
         const embed = buildOrderEmbed(order, page);
@@ -506,58 +509,59 @@ client.on("interactionCreate", async (interaction) => {
     try {
       if (interaction.isRepliable()) {
         if (interaction.deferred) {
-          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
+          await interaction.editReply({
+            content: "❌ Erro interno. Veja logs do Render.",
+            flags: MessageFlags.Ephemeral,
+          });
         } else {
-          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
+          await interaction.reply({
+            content: "❌ Erro interno. Veja logs do Render.",
+            flags: MessageFlags.Ephemeral,
+          });
         }
       }
     } catch (_) {}
   }
 });
 
-// ======= READY: só aqui faz coisas "pesadas" =======
-client.once("ready", async () => {
-  console.log(`🤖 Bot online como: ${client.user.tag}`);
-
-  try {
-    await registerCommands();
-  } catch (e) {
-    console.error("❌ Erro registrando commands:", e);
-  }
-
-  startAutoSync();
-  startAutoCleanup();
-});
-
-// ======= LOGIN IMEDIATO (COM DIAGNÓSTICO) =======
-console.log("BOOT: chamando client.login...");
-
-const loginTimeout = setTimeout(async () => {
-  console.error("❌ LOGIN TIMEOUT: client.login não resolveu em 25s");
-
-  // teste direto na API do Discord para ver se o Render consegue sair pra internet
+// ======= BOOT (RETRY + DIAG SEM DERRUBAR O SERVIÇO) =======
+async function diagDiscord() {
   try {
     const r = await fetch("https://discord.com/api/v10/users/@me", {
-      headers: { Authorization: `Bot ${DISCORD_TOKEN}` }
+      headers: {
+        Authorization: `Bot ${DISCORD_TOKEN}`,
+        "User-Agent": "DiscordBot (https://example.com, 1.0)",
+        Accept: "application/json",
+      },
     });
     const txt = await r.text();
-    console.error("DIAG Discord /users/@me status =", r.status, "body =", txt.slice(0, 200));
+    console.log("DIAG /users/@me status =", r.status, "body head =", txt.slice(0, 120));
   } catch (e) {
-    console.error("DIAG Falha ao acessar discord.com (rede/DNS/TLS):", e);
+    console.error("DIAG Falha de rede/TLS:", e);
   }
+}
 
-  // força reboot do Render pra tentar reconectar
-  process.exit(1);
-}, 25000);
+async function loginWithRetry() {
+  console.log("BOOT: chamando client.login...");
 
-client
-  .login(DISCORD_TOKEN)
-  .then(() => {
-    clearTimeout(loginTimeout);
-    console.log("✅ Login enviado ao Discord");
-  })
-  .catch((err) => {
-    clearTimeout(loginTimeout);
-    console.error("❌ Erro no login do Discord:", err);
-    process.exit(1);
-  });
+  const loginPromise = client.login(DISCORD_TOKEN);
+  const timeoutPromise = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error("LOGIN TIMEOUT em 25s")), 25000)
+  );
+
+  try {
+    await Promise.race([loginPromise, timeoutPromise]);
+    console.log("✅ Login OK (promise resolveu)");
+  } catch (err) {
+    console.error("❌ Login falhou/timeout:", err?.message || err);
+    await diagDiscord();
+
+    console.log("⏳ Aguardando 5 minutos para tentar login novamente...");
+    setTimeout(loginWithRetry, 5 * 60 * 1000);
+  }
+}
+
+client.on("error", (e) => console.error("CLIENT ERROR:", e));
+client.on("warn", (w) => console.warn("CLIENT WARN:", w));
+
+loginWithRetry();
