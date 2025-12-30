@@ -1,7 +1,13 @@
-// index.js
 require("dotenv").config();
 
+// ====== LOGS DE BOOT (pra diagnosticar sempre) ======
+process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
+
+console.log("BOOT: iniciando index.js...");
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
+console.log("ENV CHANNEL_ID:", !!process.env.CHANNEL_ID);
+console.log("ENV SHEETS:", !!process.env.SHEETS_API_URL, !!process.env.SHEETS_API_KEY);
 
 // ===== Render needs an open port for Web Service =====
 const http = require("http");
@@ -60,18 +66,12 @@ const client = new Client({
 
 // ======= Helpers (Sheets API) =======
 async function sheetsGet(action) {
-  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(
-    SHEETS_API_KEY
-  )}`;
+  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(SHEETS_API_KEY)}`;
   const res = await fetch(url, { method: "GET" });
 
   const text = await res.text();
   let data = {};
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets GET failed: ${res.status} ${JSON.stringify(data)}`);
@@ -88,11 +88,7 @@ async function sheetsPost(payload) {
 
   const text = await res.text();
   let data = {};
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets POST failed: ${res.status} ${JSON.stringify(data)}`);
@@ -128,10 +124,8 @@ function buildOrderEmbed(order, page = 0) {
   const lines = slice.map((it, idx) => {
     const n = start + idx + 1;
     const qtd = it.qtd ? ` x${it.qtd}` : "";
-
     const st = String(it.status || "").toUpperCase().trim();
     const box = st === "TENHO" ? "🟩" : st === "FALTA" ? "🟥" : "⬜";
-
     return `${box} ${n}. ${it.produto}${qtd}`;
   });
 
@@ -139,12 +133,12 @@ function buildOrderEmbed(order, page = 0) {
     .setTitle("📦 Conferência de Pedido")
     .setDescription(
       `**Pedido:** #${order.pedido}\n` +
-        `**Marketplace:** ${order.marketplace || "-"}\n` +
-        `**Cliente:** ${order.cliente || "-"}\n\n` +
-        `**Produtos:**\n${lines.join("\n")}\n\n` +
-        `**Status do pedido:** **PENDENTE**\n` +
-        `**Página:** ${safePage + 1}/${totalPages}\n` +
-        `Marque item por item ou use os botões desta página.`
+      `**Marketplace:** ${order.marketplace || "-"}\n` +
+      `**Cliente:** ${order.cliente || "-"}\n\n` +
+      `**Produtos:**\n${lines.join("\n")}\n\n` +
+      `**Status do pedido:** **PENDENTE**\n` +
+      `**Página:** ${safePage + 1}/${totalPages}\n` +
+      `Marque item por item ou use os botões desta página.`
     );
 }
 
@@ -169,7 +163,7 @@ function buildOrderComponents(order, page = 0) {
         new ButtonBuilder()
           .setCustomId(`it:falta:${order.pedido}:${safePage}:${it.itemKey}`)
           .setLabel(`Falta (Prod ${labelN})`)
-          .setStyle(ButtonStyle.Danger)
+          .setStyle(ButtonStyle.Danger),
       )
     );
   }
@@ -195,7 +189,7 @@ function buildOrderComponents(order, page = 0) {
     new ButtonBuilder()
       .setCustomId(`pg:falta_all:${order.pedido}:${safePage}`)
       .setLabel("Falta todos desta página")
-      .setStyle(ButtonStyle.Danger)
+      .setStyle(ButtonStyle.Danger),
   );
 
   rows.push(nav);
@@ -207,15 +201,9 @@ const orderCache = new Map(); // pedido -> orderObject
 // ======= Commands =======
 const commands = [
   new SlashCommandBuilder().setName("ping").setDescription("Testa o bot"),
-
-  new SlashCommandBuilder()
-    .setName("sync")
-    .setDescription("Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."),
-
-  new SlashCommandBuilder()
-    .setName("limpar_confirmados")
-    .setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM.")
-].map((c) => c.toJSON());
+  new SlashCommandBuilder().setName("sync").setDescription("Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."),
+  new SlashCommandBuilder().setName("limpar_confirmados").setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM.")
+].map(c => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
@@ -323,9 +311,7 @@ async function cleanupConfirmedOnce() {
       deletedRows += Number(r.deletedRows || 0);
     }
 
-    console.log(
-      `CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`
-    );
+    console.log(`CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`);
     return { deletedDiscord, deletedRows, total: orders.length };
   } catch (err) {
     console.error("CLEANUP error:", err);
@@ -345,21 +331,6 @@ function startAutoCleanup() {
   cleanupConfirmedOnce();
   setInterval(cleanupConfirmedOnce, ms);
 }
-
-// ======= READY =======
-// (Ajuste principal: registrar comandos aqui, depois que o bot realmente conecta)
-client.once("ready", async () => {
-  console.log(`🤖 Bot online como: ${client.user.tag}`);
-
-  try {
-    await registerCommands();
-  } catch (e) {
-    console.error("❌ Falha ao registrar commands:", e);
-  }
-
-  startAutoSync();
-  startAutoCleanup();
-});
 
 // ======= Interaction Handler =======
 client.on("interactionCreate", async (interaction) => {
@@ -404,14 +375,13 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         const result = await cleanupConfirmedOnce();
-        if (result?.error) {
-          return interaction.editReply(`❌ Erro: ${result.error}`);
-        }
+        if (result?.error) return interaction.editReply(`❌ Erro: ${result.error}`);
+
         return interaction.editReply(
           `✅ Limpeza concluída.\n` +
-            `• Pedidos processados: ${result.total}\n` +
-            `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
-            `• Linhas removidas da planilha: ${result.deletedRows}`
+          `• Pedidos processados: ${result.total}\n` +
+          `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
+          `• Linhas removidas da planilha: ${result.deletedRows}`
         );
       }
     }
@@ -482,7 +452,7 @@ client.on("interactionCreate", async (interaction) => {
           conferidoEmISO: nowISO
         });
 
-        const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
+        const it = order.items.find(x => String(x.itemKey) === String(itemKey));
         if (it) it.status = status;
 
         const embed = buildOrderEmbed(order, page);
@@ -495,23 +465,31 @@ client.on("interactionCreate", async (interaction) => {
     try {
       if (interaction.isRepliable()) {
         if (interaction.deferred) {
-          await interaction.editReply({
-            content: "❌ Erro interno. Veja logs do Render.",
-            flags: MessageFlags.Ephemeral
-          });
+          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
         } else {
-          await interaction.reply({
-            content: "❌ Erro interno. Veja logs do Render.",
-            flags: MessageFlags.Ephemeral
-          });
+          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
         }
       }
     } catch (_) {}
   }
 });
 
-// ======= Boot (AJUSTE PRINCIPAL) =======
-// Não usar await aqui. No Render pode demorar >20s e seu boot não pode "estourar timeout".
+// ======= READY: só aqui faz coisas "pesadas" =======
+client.once("ready", async () => {
+  console.log(`🤖 Bot online como: ${client.user.tag}`);
+
+  try {
+    await registerCommands();
+  } catch (e) {
+    console.error("❌ Erro registrando commands:", e);
+  }
+
+  startAutoSync();
+  startAutoCleanup();
+});
+
+// ======= LOGIN IMEDIATO (SEM BLOQUEAR) =======
+console.log("BOOT: chamando client.login...");
 client
   .login(DISCORD_TOKEN)
   .then(() => console.log("✅ Login enviado ao Discord"))
