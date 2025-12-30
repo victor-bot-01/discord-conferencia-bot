@@ -26,10 +26,9 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  MessageFlags,
+  MessageFlags
 } = require("discord.js");
 
-// ======= ENV =======
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID; // opcional
@@ -54,26 +53,18 @@ if (!CHANNEL_ID) {
   process.exit(1);
 }
 
-// ======= CLIENT (CRIA PRIMEIRO!) =======
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds]
 });
 
 // ======= Helpers (Sheets API) =======
 async function sheetsGet(action) {
-  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(
-    action
-  )}&key=${encodeURIComponent(SHEETS_API_KEY)}`;
-
+  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(SHEETS_API_KEY)}`;
   const res = await fetch(url, { method: "GET" });
 
   const text = await res.text();
   let data = {};
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets GET failed: ${res.status} ${JSON.stringify(data)}`);
@@ -85,16 +76,12 @@ async function sheetsPost(payload) {
   const res = await fetch(SHEETS_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, key: SHEETS_API_KEY }),
+    body: JSON.stringify({ ...payload, key: SHEETS_API_KEY })
   });
 
   const text = await res.text();
   let data = {};
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets POST failed: ${res.status} ${JSON.stringify(data)}`);
@@ -104,14 +91,18 @@ async function sheetsPost(payload) {
 
 // ======= Helpers (Discord delete via REST) =======
 async function deleteDiscordMessageById(messageId) {
+  // Usa a API do Discord direto (não precisa intents de mensagens)
   const url = `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages/${messageId}`;
 
   const res = await fetch(url, {
     method: "DELETE",
-    headers: { Authorization: `Bot ${DISCORD_TOKEN}` },
+    headers: { Authorization: `Bot ${DISCORD_TOKEN}` }
   });
 
+  // 204 = apagou
   if (res.status === 204) return { ok: true, status: 204 };
+
+  // 404 = já não existe -> consideramos ok para não travar a limpeza
   if (res.status === 404) return { ok: true, status: 404 };
 
   const body = await res.text().catch(() => "");
@@ -141,12 +132,12 @@ function buildOrderEmbed(order, page = 0) {
     .setTitle("📦 Conferência de Pedido")
     .setDescription(
       `**Pedido:** #${order.pedido}\n` +
-        `**Marketplace:** ${order.marketplace || "-"}\n` +
-        `**Cliente:** ${order.cliente || "-"}\n\n` +
-        `**Produtos:**\n${lines.join("\n")}\n\n` +
-        `**Status do pedido:** **PENDENTE**\n` +
-        `**Página:** ${safePage + 1}/${totalPages}\n` +
-        `Marque item por item ou use os botões desta página.`
+      `**Marketplace:** ${order.marketplace || "-"}\n` +
+      `**Cliente:** ${order.cliente || "-"}\n\n` +
+      `**Produtos:**\n${lines.join("\n")}\n\n` +
+      `**Status do pedido:** **PENDENTE**\n` +
+      `**Página:** ${safePage + 1}/${totalPages}\n` +
+      `Marque item por item ou use os botões desta página.`
     );
 }
 
@@ -171,7 +162,7 @@ function buildOrderComponents(order, page = 0) {
         new ButtonBuilder()
           .setCustomId(`it:falta:${order.pedido}:${safePage}:${it.itemKey}`)
           .setLabel(`Falta (Prod ${labelN})`)
-          .setStyle(ButtonStyle.Danger)
+          .setStyle(ButtonStyle.Danger),
       )
     );
   }
@@ -197,7 +188,7 @@ function buildOrderComponents(order, page = 0) {
     new ButtonBuilder()
       .setCustomId(`pg:falta_all:${order.pedido}:${safePage}`)
       .setLabel("Falta todos desta página")
-      .setStyle(ButtonStyle.Danger)
+      .setStyle(ButtonStyle.Danger),
   );
 
   rows.push(nav);
@@ -208,25 +199,23 @@ const orderCache = new Map(); // pedido -> orderObject
 
 // ======= Commands =======
 const commands = [
-  new SlashCommandBuilder().setName("ping").setDescription("Testa o bot"),
+  new SlashCommandBuilder()
+    .setName("ping")
+    .setDescription("Testa o bot"),
 
   new SlashCommandBuilder()
     .setName("sync")
-    .setDescription(
-      "Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."
-    ),
+    .setDescription("Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."),
 
   new SlashCommandBuilder()
     .setName("limpar_confirmados")
-    .setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM."),
-].map((c) => c.toJSON());
+    .setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM.")
+].map(c => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
   if (GUILD_ID) {
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-      body: commands,
-    });
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
     console.log("✅ Commands registered (guild).");
   } else {
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
@@ -269,7 +258,7 @@ async function autoSyncOnce() {
       await sheetsPost({
         action: "set_message_id",
         pedido: String(order.pedido),
-        messageId: String(msg.id),
+        messageId: String(msg.id)
       });
 
       sent++;
@@ -294,7 +283,7 @@ function startAutoSync() {
   setInterval(autoSyncOnce, ms);
 }
 
-// ======= CLEANUP CONFIRMADOS =======
+// ======= CLEANUP CONFIRMADOS (PASSO 3.1) =======
 let isCleanupRunning = false;
 
 async function cleanupConfirmedOnce() {
@@ -302,6 +291,8 @@ async function cleanupConfirmedOnce() {
   isCleanupRunning = true;
 
   try {
+    // precisa existir no Apps Script:
+    // GET ?action=list_confirmed&key=...
     const data = await sheetsGet("list_confirmed");
     const orders = data.orders || [];
 
@@ -317,21 +308,23 @@ async function cleanupConfirmedOnce() {
       const messageId = String(o.discordMessageId || o.messageId || "").trim();
       if (!messageId) continue;
 
+      // 1) apaga no Discord
       const del = await deleteDiscordMessageById(messageId);
       if (!del.ok) {
         console.error("CLEANUP: failed to delete discord message", messageId, del);
-        continue;
+        continue; // não apaga da planilha se não conseguiu apagar no Discord
       }
 
       deletedDiscord++;
 
+      // 2) apaga as linhas na planilha pelo messageId
+      // precisa existir no Apps Script:
+      // POST {action:"delete_order_by_message_id", messageId, key}
       const r = await sheetsPost({ action: "delete_order_by_message_id", messageId });
       deletedRows += Number(r.deletedRows || 0);
     }
 
-    console.log(
-      `CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`
-    );
+    console.log(`CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`);
     return { deletedDiscord, deletedRows, total: orders.length };
   } catch (err) {
     console.error("CLEANUP error:", err);
@@ -353,20 +346,8 @@ function startAutoCleanup() {
 }
 
 // ======= READY =======
-let commandsRegistered = false;
-
-client.once("ready", async () => {
+client.once("ready", () => {
   console.log(`🤖 Bot online como: ${client.user.tag}`);
-
-  try {
-    if (!commandsRegistered) {
-      commandsRegistered = true;
-      await registerCommands();
-    }
-  } catch (e) {
-    console.error("❌ Failed to register commands:", e);
-  }
-
   startAutoSync();
   startAutoCleanup();
 });
@@ -386,9 +367,7 @@ client.on("interactionCreate", async (interaction) => {
         const orders = data.orders || [];
 
         if (!orders.length) {
-          return interaction.editReply(
-            "Nada para sincronizar: nenhum pedido PENDENTE sem DiscordMessageId."
-          );
+          return interaction.editReply("Nada para sincronizar: nenhum pedido PENDENTE sem DiscordMessageId.");
         }
 
         let sent = 0;
@@ -403,15 +382,13 @@ client.on("interactionCreate", async (interaction) => {
           await sheetsPost({
             action: "set_message_id",
             pedido: String(order.pedido),
-            messageId: String(msg.id),
+            messageId: String(msg.id)
           });
 
           sent++;
         }
 
-        return interaction.editReply(
-          `✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) para este canal.`
-        );
+        return interaction.editReply(`✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) para este canal.`);
       }
 
       if (interaction.commandName === "limpar_confirmados") {
@@ -423,13 +400,14 @@ client.on("interactionCreate", async (interaction) => {
         }
         return interaction.editReply(
           `✅ Limpeza concluída.\n` +
-            `• Pedidos processados: ${result.total}\n` +
-            `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
-            `• Linhas removidas da planilha: ${result.deletedRows}`
+          `• Pedidos processados: ${result.total}\n` +
+          `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
+          `• Linhas removidas da planilha: ${result.deletedRows}`
         );
       }
     }
 
+    // Buttons
     if (interaction.isButton()) {
       await interaction.deferUpdate();
 
@@ -438,7 +416,7 @@ client.on("interactionCreate", async (interaction) => {
       const type = parts[0];
 
       if (type === "pg") {
-        const action = parts[1];
+        const action = parts[1]; // prev | next | tenho_all | falta_all
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
 
@@ -466,7 +444,7 @@ client.on("interactionCreate", async (interaction) => {
             itemKey: String(it.itemKey),
             status,
             conferidoPor: who,
-            conferidoEmISO: nowISO,
+            conferidoEmISO: nowISO
           });
           it.status = status;
         }
@@ -493,10 +471,10 @@ client.on("interactionCreate", async (interaction) => {
           itemKey: String(itemKey),
           status,
           conferidoPor: who,
-          conferidoEmISO: nowISO,
+          conferidoEmISO: nowISO
         });
 
-        const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
+        const it = order.items.find(x => String(x.itemKey) === String(itemKey));
         if (it) it.status = status;
 
         const embed = buildOrderEmbed(order, page);
@@ -509,59 +487,17 @@ client.on("interactionCreate", async (interaction) => {
     try {
       if (interaction.isRepliable()) {
         if (interaction.deferred) {
-          await interaction.editReply({
-            content: "❌ Erro interno. Veja logs do Render.",
-            flags: MessageFlags.Ephemeral,
-          });
+          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
         } else {
-          await interaction.reply({
-            content: "❌ Erro interno. Veja logs do Render.",
-            flags: MessageFlags.Ephemeral,
-          });
+          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
         }
       }
     } catch (_) {}
   }
 });
 
-// ======= BOOT (RETRY + DIAG SEM DERRUBAR O SERVIÇO) =======
-async function diagDiscord() {
-  try {
-    const r = await fetch("https://discord.com/api/v10/users/@me", {
-      headers: {
-        Authorization: `Bot ${DISCORD_TOKEN}`,
-        "User-Agent": "DiscordBot (https://example.com, 1.0)",
-        Accept: "application/json",
-      },
-    });
-    const txt = await r.text();
-    console.log("DIAG /users/@me status =", r.status, "body head =", txt.slice(0, 120));
-  } catch (e) {
-    console.error("DIAG Falha de rede/TLS:", e);
-  }
-}
-
-async function loginWithRetry() {
-  console.log("BOOT: chamando client.login...");
-
-  const loginPromise = client.login(DISCORD_TOKEN);
-  const timeoutPromise = new Promise((_, rej) =>
-    setTimeout(() => rej(new Error("LOGIN TIMEOUT em 25s")), 25000)
-  );
-
-  try {
-    await Promise.race([loginPromise, timeoutPromise]);
-    console.log("✅ Login OK (promise resolveu)");
-  } catch (err) {
-    console.error("❌ Login falhou/timeout:", err?.message || err);
-    await diagDiscord();
-
-    console.log("⏳ Aguardando 5 minutos para tentar login novamente...");
-    setTimeout(loginWithRetry, 5 * 60 * 1000);
-  }
-}
-
-client.on("error", (e) => console.error("CLIENT ERROR:", e));
-client.on("warn", (w) => console.warn("CLIENT WARN:", w));
-
-loginWithRetry();
+// ======= Boot =======
+(async () => {
+  await registerCommands();
+  await client.login(DISCORD_TOKEN);
+})();
