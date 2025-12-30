@@ -1,5 +1,13 @@
 require("dotenv").config();
 
+// ===================== HARD LOGS (para não ficar "silencioso") =====================
+process.on("unhandledRejection", (reason) => {
+  console.error("🔥 unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("🔥 uncaughtException:", err);
+});
+
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
 
 // ===== Render needs an open port for Web Service =====
@@ -91,7 +99,6 @@ async function sheetsPost(payload) {
 
 // ======= Helpers (Discord delete via REST) =======
 async function deleteDiscordMessageById(messageId) {
-  // Usa a API do Discord direto (não precisa intents de mensagens)
   const url = `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages/${messageId}`;
 
   const res = await fetch(url, {
@@ -99,10 +106,7 @@ async function deleteDiscordMessageById(messageId) {
     headers: { Authorization: `Bot ${DISCORD_TOKEN}` }
   });
 
-  // 204 = apagou
   if (res.status === 204) return { ok: true, status: 204 };
-
-  // 404 = já não existe -> consideramos ok para não travar a limpeza
   if (res.status === 404) return { ok: true, status: 404 };
 
   const body = await res.text().catch(() => "");
@@ -195,7 +199,7 @@ function buildOrderComponents(order, page = 0) {
   return rows;
 }
 
-const orderCache = new Map(); // pedido -> orderObject
+const orderCache = new Map();
 
 // ======= Commands =======
 const commands = [
@@ -291,8 +295,6 @@ async function cleanupConfirmedOnce() {
   isCleanupRunning = true;
 
   try {
-    // precisa existir no Apps Script:
-    // GET ?action=list_confirmed&key=...
     const data = await sheetsGet("list_confirmed");
     const orders = data.orders || [];
 
@@ -308,18 +310,14 @@ async function cleanupConfirmedOnce() {
       const messageId = String(o.discordMessageId || o.messageId || "").trim();
       if (!messageId) continue;
 
-      // 1) apaga no Discord
       const del = await deleteDiscordMessageById(messageId);
       if (!del.ok) {
         console.error("CLEANUP: failed to delete discord message", messageId, del);
-        continue; // não apaga da planilha se não conseguiu apagar no Discord
+        continue;
       }
 
       deletedDiscord++;
 
-      // 2) apaga as linhas na planilha pelo messageId
-      // precisa existir no Apps Script:
-      // POST {action:"delete_order_by_message_id", messageId, key}
       const r = await sheetsPost({ action: "delete_order_by_message_id", messageId });
       deletedRows += Number(r.deletedRows || 0);
     }
@@ -407,7 +405,6 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
-    // Buttons
     if (interaction.isButton()) {
       await interaction.deferUpdate();
 
@@ -416,7 +413,7 @@ client.on("interactionCreate", async (interaction) => {
       const type = parts[0];
 
       if (type === "pg") {
-        const action = parts[1]; // prev | next | tenho_all | falta_all
+        const action = parts[1];
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
 
@@ -496,8 +493,29 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// ======= Boot =======
+// ===================== BOOT (AJUSTADO: LOGIN ANTES, COM TIMEOUT) =====================
+async function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`TIMEOUT: ${label} (${ms}ms)`)), ms)
+    ),
+  ]);
+}
+
 (async () => {
-  await registerCommands();
-  await client.login(DISCORD_TOKEN);
+  try {
+    console.log("🚀 BOOT: iniciando...");
+
+    console.log("🔑 BOOT: chamando client.login...");
+    await withTimeout(client.login(DISCORD_TOKEN), 20000, "client.login");
+    console.log("✅ BOOT: login OK");
+
+    console.log("🧾 BOOT: registrando comandos...");
+    await withTimeout(registerCommands(), 20000, "registerCommands");
+    console.log("✅ BOOT: comandos registrados");
+  } catch (err) {
+    console.error("❌ BOOT ERROR:", err);
+    process.exit(1);
+  }
 })();
