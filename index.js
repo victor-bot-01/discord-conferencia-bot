@@ -1,13 +1,54 @@
 require("dotenv").config();
 
-// ====== LOGS DE BOOT (pra diagnosticar sempre) ======
-process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
-process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
+// ======= BOOT (RETRY + DIAG SEM MATAR O SERVIÇO) =======
+async function diagDiscord() {
+  try {
+    const r = await fetch("https://discord.com/api/v10/users/@me", {
+      headers: {
+        Authorization: `Bot ${DISCORD_TOKEN}`,
+        "User-Agent": "DiscordBot (https://example.com, 1.0)",
+        Accept: "application/json"
+      }
+    });
+    const txt = await r.text();
+    console.log("DIAG /users/@me status =", r.status, "body head =", txt.slice(0, 120));
+  } catch (e) {
+    console.error("DIAG Falha de rede/TLS:", e);
+  }
+}
 
-console.log("BOOT: iniciando index.js...");
-console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
-console.log("ENV CHANNEL_ID:", !!process.env.CHANNEL_ID);
-console.log("ENV SHEETS:", !!process.env.SHEETS_API_URL, !!process.env.SHEETS_API_KEY);
+async function loginWithRetry() {
+  console.log("BOOT: chamando client.login...");
+
+  // tenta logar e espera no máximo 25s
+  const loginPromise = client.login(DISCORD_TOKEN);
+  const timeoutPromise = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error("LOGIN TIMEOUT em 25s")), 25000)
+  );
+
+  try {
+    await Promise.race([loginPromise, timeoutPromise]);
+    console.log("✅ Login OK (promise resolveu)");
+  } catch (err) {
+    console.error("❌ Login falhou/timeout:", err?.message || err);
+    await diagDiscord();
+
+    // espera 5 minutos antes de tentar de novo (pra não ficar tomando 429)
+    console.log("⏳ Aguardando 5 minutos para tentar login novamente...");
+    setTimeout(loginWithRetry, 5 * 60 * 1000);
+  }
+}
+
+client.on("ready", () => {
+  console.log(`🤖 Bot online como: ${client.user.tag}`);
+  startAutoSync();
+  startAutoCleanup();
+});
+
+client.on("error", (e) => console.error("CLIENT ERROR:", e));
+client.on("warn", (w) => console.warn("CLIENT WARN:", w));
+
+loginWithRetry();
 
 // ===== Render needs an open port for Web Service =====
 const http = require("http");
