@@ -488,9 +488,35 @@ client.once("ready", async () => {
   startAutoCleanup();
 });
 
-// ======= LOGIN IMEDIATO (SEM BLOQUEAR) =======
+// ======= LOGIN IMEDIATO (COM DIAGNÓSTICO) =======
 console.log("BOOT: chamando client.login...");
+
+const loginTimeout = setTimeout(async () => {
+  console.error("❌ LOGIN TIMEOUT: client.login não resolveu em 25s");
+
+  // teste direto na API do Discord para ver se o Render consegue sair pra internet
+  try {
+    const r = await fetch("https://discord.com/api/v10/users/@me", {
+      headers: { Authorization: `Bot ${DISCORD_TOKEN}` }
+    });
+    const txt = await r.text();
+    console.error("DIAG Discord /users/@me status =", r.status, "body =", txt.slice(0, 200));
+  } catch (e) {
+    console.error("DIAG Falha ao acessar discord.com (rede/DNS/TLS):", e);
+  }
+
+  // força reboot do Render pra tentar reconectar
+  process.exit(1);
+}, 25000);
+
 client
   .login(DISCORD_TOKEN)
-  .then(() => console.log("✅ Login enviado ao Discord"))
-  .catch((err) => console.error("❌ Erro no login do Discord:", err));
+  .then(() => {
+    clearTimeout(loginTimeout);
+    console.log("✅ Login enviado ao Discord");
+  })
+  .catch((err) => {
+    clearTimeout(loginTimeout);
+    console.error("❌ Erro no login do Discord:", err);
+    process.exit(1);
+  });
