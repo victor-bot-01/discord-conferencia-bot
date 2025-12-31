@@ -16,6 +16,9 @@ http
   });
 // ====================================================
 
+const fs = require("fs");
+const path = require("path");
+
 const {
   Client,
   GatewayIntentBits,
@@ -26,7 +29,9 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
-  MessageFlags
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require("discord.js");
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -54,17 +59,23 @@ if (!CHANNEL_ID) {
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [GatewayIntentBits.Guilds],
 });
 
 // ======= Helpers (Sheets API) =======
 async function sheetsGet(action) {
-  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(SHEETS_API_KEY)}`;
+  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(
+    SHEETS_API_KEY
+  )}`;
   const res = await fetch(url, { method: "GET" });
 
   const text = await res.text();
   let data = {};
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
 
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets GET failed: ${res.status} ${JSON.stringify(data)}`);
@@ -76,12 +87,16 @@ async function sheetsPost(payload) {
   const res = await fetch(SHEETS_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, key: SHEETS_API_KEY })
+    body: JSON.stringify({ ...payload, key: SHEETS_API_KEY }),
   });
 
   const text = await res.text();
   let data = {};
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
 
   if (!res.ok || !data.ok) {
     throw new Error(`Sheets POST failed: ${res.status} ${JSON.stringify(data)}`);
@@ -91,57 +106,135 @@ async function sheetsPost(payload) {
 
 // ======= Helpers (Discord delete via REST) =======
 async function deleteDiscordMessageById(messageId) {
-  // Usa a API do Discord direto (não precisa intents de mensagens)
   const url = `https://discord.com/api/v10/channels/${CHANNEL_ID}/messages/${messageId}`;
 
   const res = await fetch(url, {
     method: "DELETE",
-    headers: { Authorization: `Bot ${DISCORD_TOKEN}` }
+    headers: { Authorization: `Bot ${DISCORD_TOKEN}` },
   });
 
-  // 204 = apagou
   if (res.status === 204) return { ok: true, status: 204 };
-
-  // 404 = já não existe -> consideramos ok para não travar a limpeza
   if (res.status === 404) return { ok: true, status: 404 };
 
   const body = await res.text().catch(() => "");
   return { ok: false, status: res.status, body };
 }
 
+// ======= Cache persistente =======
+const STATE_FILE = path.join(__dirname, "state.json");
+const orderCache = new Map(); // pedido -> orderObject
+let saveTimer = null;
+
+function safeReadJSON(file) {
+  try {
+    if (!fs.existsSync(file)) return null;
+    const raw = fs.readFileSync(file, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function loadCacheFromDisk() {
+  const data = safeReadJSON(STATE_FILE);
+  if (!data || !data.orderCache) return 0;
+
+  let count = 0;
+  for (const [pedido, order] of Object.entries(data.orderCache)) {
+    if (order && order.items && Array.isArray(order.items)) {
+      orderCache.set(String(pedido), order);
+      count++;
+    }
+  }
+  return count;
+}
+
+function scheduleSaveCache() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      const obj = {};
+      for (const [pedido, order] of orderCache.entries()) {
+        obj[String(pedido)] = order;
+      }
+      fs.writeFileSync(STATE_FILE, JSON.stringify({ orderCache: obj }, null, 2), "utf8");
+    } catch (e) {
+      console.log("WARN: failed to save state.json:", e?.message || e);
+    }
+  }, 500);
+}
+
+async function ensureOrderInCache(pedido) {
+  const key = String(pedido);
+  const cached = orderCache.get(key);
+  if (cached) return cached;
+
+  try {
+    const data = await sheetsGet("list_pending");
+    const orders = data.orders || [];
+    const found = orders.find((o) => String(o.pedido) === key);
+    if (found) {
+      orderCache.set(key, found);
+      scheduleSaveCache();
+      return found;
+    }
+  } catch (_) {}
+
+  return null;
+}
+
 // ======= UI (Pedido) =======
+// Lista completa; botões paginados
 const PAGE_SIZE = 4;
+
+function extractFaltaObs(statusRaw) {
+  const s = String(statusRaw || "").trim();
+  const up = s.toUpperCase();
+  if (up.startsWith("FALTA -")) {
+    // mantém o texto original depois do primeiro "-"
+    const idx = s.indexOf("-");
+    const obs = idx >= 0 ? s.slice(idx + 1).trim() : "";
+    return obs;
+  }
+  return "";
+}
 
 function buildOrderEmbed(order, page = 0) {
   const totalPages = Math.max(1, Math.ceil(order.items.length / PAGE_SIZE));
   const safePage = Math.max(0, Math.min(page, totalPages - 1));
   const start = safePage * PAGE_SIZE;
-  const slice = order.items.slice(start, start + PAGE_SIZE);
 
-  const lines = slice.map((it, idx) => {
-    const n = start + idx + 1;
+  const allLines = order.items.map((it, idx) => {
+    const n = idx + 1;
     const qtd = it.qtd ? ` x${it.qtd}` : "";
 
     const st = String(it.status || "").toUpperCase().trim();
-    const box = st === "TENHO" ? "🟩" : st === "FALTA" ? "🟥" : "⬜";
+    const box = st.startsWith("TENHO") ? "🟩" : st.startsWith("FALTA") ? "🟥" : "⬜";
 
-    return `${box} ${n}. ${it.produto}${qtd}`;
+    const faltaObs = extractFaltaObs(it.status);
+    const obsTxt = faltaObs ? ` — **${faltaObs}**` : "";
+
+    return `${box} ${n}. ${it.produto}${qtd}${obsTxt}`;
   });
+
+  const btnRange = `${start + 1}-${Math.min(start + PAGE_SIZE, order.items.length)}`;
 
   return new EmbedBuilder()
     .setTitle("📦 Conferência de Pedido")
     .setDescription(
       `**Pedido:** #${order.pedido}\n` +
-      `**Marketplace:** ${order.marketplace || "-"}\n` +
-      `**Cliente:** ${order.cliente || "-"}\n\n` +
-      `**Produtos:**\n${lines.join("\n")}\n\n` +
-      `**Status do pedido:** **PENDENTE**\n` +
-      `**Página:** ${safePage + 1}/${totalPages}\n` +
-      `Marque item por item ou use os botões desta página.`
+        `**Marketplace:** ${order.marketplace || "-"}\n` +
+        `**Cliente:** ${order.cliente || "-"}\n\n` +
+        `**Produtos:**\n${allLines.join("\n")}\n\n` +
+        `**Status do pedido:** **PENDENTE**\n` +
+        `**Botões desta página:** Itens **${btnRange}**\n` +
+        `**Página (botões):** ${safePage + 1}/${totalPages}\n` +
+        `Marque item por item ou use os botões desta página.`
     );
 }
 
-function buildOrderComponents(order, page = 0) {
+function buildOrderComponents(order, page = 0, messageIdForButtons = "") {
   const totalPages = Math.max(1, Math.ceil(order.items.length / PAGE_SIZE));
   const safePage = Math.max(0, Math.min(page, totalPages - 1));
   const start = safePage * PAGE_SIZE;
@@ -155,14 +248,16 @@ function buildOrderComponents(order, page = 0) {
 
     rows.push(
       new ActionRowBuilder().addComponents(
+        // ✅ AGORA: tenho também leva messageId no final
         new ButtonBuilder()
-          .setCustomId(`it:tenho:${order.pedido}:${safePage}:${it.itemKey}`)
+          .setCustomId(`it:tenho:${order.pedido}:${safePage}:${it.itemKey}:${messageIdForButtons}`)
           .setLabel(`Tenho (Prod ${labelN})`)
           .setStyle(ButtonStyle.Success),
+
         new ButtonBuilder()
-          .setCustomId(`it:falta:${order.pedido}:${safePage}:${it.itemKey}`)
+          .setCustomId(`it:falta_obs:${order.pedido}:${safePage}:${it.itemKey}:${messageIdForButtons}`)
           .setLabel(`Falta (Prod ${labelN})`)
-          .setStyle(ButtonStyle.Danger),
+          .setStyle(ButtonStyle.Danger)
       )
     );
   }
@@ -188,29 +283,23 @@ function buildOrderComponents(order, page = 0) {
     new ButtonBuilder()
       .setCustomId(`pg:falta_all:${order.pedido}:${safePage}`)
       .setLabel("Falta todos desta página")
-      .setStyle(ButtonStyle.Danger),
+      .setStyle(ButtonStyle.Danger)
   );
 
   rows.push(nav);
   return rows;
 }
 
-const orderCache = new Map(); // pedido -> orderObject
-
 // ======= Commands =======
 const commands = [
-  new SlashCommandBuilder()
-    .setName("ping")
-    .setDescription("Testa o bot"),
-
+  new SlashCommandBuilder().setName("ping").setDescription("Testa o bot"),
   new SlashCommandBuilder()
     .setName("sync")
     .setDescription("Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."),
-
   new SlashCommandBuilder()
     .setName("limpar_confirmados")
-    .setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM.")
-].map(c => c.toJSON());
+    .setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM."),
+].map((c) => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
@@ -249,16 +338,20 @@ async function autoSyncOnce() {
 
     for (const order of orders) {
       orderCache.set(String(order.pedido), order);
+      scheduleSaveCache();
 
       const embed = buildOrderEmbed(order, 0);
-      const components = buildOrderComponents(order, 0);
 
-      const msg = await channel.send({ embeds: [embed], components });
+      // envia primeiro, pega messageId
+      const msg = await channel.send({ embeds: [embed], components: [] });
+
+      const components = buildOrderComponents(order, 0, String(msg.id));
+      await msg.edit({ embeds: [embed], components });
 
       await sheetsPost({
         action: "set_message_id",
         pedido: String(order.pedido),
-        messageId: String(msg.id)
+        messageId: String(msg.id),
       });
 
       sent++;
@@ -283,7 +376,7 @@ function startAutoSync() {
   setInterval(autoSyncOnce, ms);
 }
 
-// ======= CLEANUP CONFIRMADOS (PASSO 3.1) =======
+// ======= CLEANUP CONFIRMADOS =======
 let isCleanupRunning = false;
 
 async function cleanupConfirmedOnce() {
@@ -291,8 +384,6 @@ async function cleanupConfirmedOnce() {
   isCleanupRunning = true;
 
   try {
-    // precisa existir no Apps Script:
-    // GET ?action=list_confirmed&key=...
     const data = await sheetsGet("list_confirmed");
     const orders = data.orders || [];
 
@@ -308,18 +399,14 @@ async function cleanupConfirmedOnce() {
       const messageId = String(o.discordMessageId || o.messageId || "").trim();
       if (!messageId) continue;
 
-      // 1) apaga no Discord
       const del = await deleteDiscordMessageById(messageId);
       if (!del.ok) {
         console.error("CLEANUP: failed to delete discord message", messageId, del);
-        continue; // não apaga da planilha se não conseguiu apagar no Discord
+        continue;
       }
 
       deletedDiscord++;
 
-      // 2) apaga as linhas na planilha pelo messageId
-      // precisa existir no Apps Script:
-      // POST {action:"delete_order_by_message_id", messageId, key}
       const r = await sheetsPost({ action: "delete_order_by_message_id", messageId });
       deletedRows += Number(r.deletedRows || 0);
     }
@@ -346,8 +433,11 @@ function startAutoCleanup() {
 }
 
 // ======= READY =======
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`🤖 Bot online como: ${client.user.tag}`);
+  const loaded = loadCacheFromDisk();
+  console.log(`CACHE: carreguei ${loaded} pedido(s) do state.json`);
+
   startAutoSync();
   startAutoCleanup();
 });
@@ -355,13 +445,14 @@ client.once("ready", () => {
 // ======= Interaction Handler =======
 client.on("interactionCreate", async (interaction) => {
   try {
+    // ===== Commands =====
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "ping") {
-        return interaction.reply({ content: "pong ✅", flags: MessageFlags.Ephemeral });
+        return interaction.reply({ content: "pong ✅", ephemeral: true });
       }
 
       if (interaction.commandName === "sync") {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await interaction.deferReply({ ephemeral: true });
 
         const data = await sheetsGet("list_pending");
         const orders = data.orders || [];
@@ -373,16 +464,18 @@ client.on("interactionCreate", async (interaction) => {
         let sent = 0;
         for (const order of orders) {
           orderCache.set(String(order.pedido), order);
+          scheduleSaveCache();
 
           const embed = buildOrderEmbed(order, 0);
-          const components = buildOrderComponents(order, 0);
+          const msg = await interaction.channel.send({ embeds: [embed], components: [] });
 
-          const msg = await interaction.channel.send({ embeds: [embed], components });
+          const components = buildOrderComponents(order, 0, String(msg.id));
+          await msg.edit({ embeds: [embed], components });
 
           await sheetsPost({
             action: "set_message_id",
             pedido: String(order.pedido),
-            messageId: String(msg.id)
+            messageId: String(msg.id),
           });
 
           sent++;
@@ -392,41 +485,93 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.commandName === "limpar_confirmados") {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await interaction.deferReply({ ephemeral: true });
 
         const result = await cleanupConfirmedOnce();
-        if (result?.error) {
-          return interaction.editReply(`❌ Erro: ${result.error}`);
-        }
+        if (result?.error) return interaction.editReply(`❌ Erro: ${result.error}`);
+
         return interaction.editReply(
           `✅ Limpeza concluída.\n` +
-          `• Pedidos processados: ${result.total}\n` +
-          `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
-          `• Linhas removidas da planilha: ${result.deletedRows}`
+            `• Pedidos processados: ${result.total}\n` +
+            `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
+            `• Linhas removidas da planilha: ${result.deletedRows}`
         );
       }
     }
 
-    // Buttons
-    if (interaction.isButton()) {
-      await interaction.deferUpdate();
+    // ===== Modal submit =====
+  if (interaction.isModalSubmit()) {
+  const cid = String(interaction.customId || "");
+  if (!cid.startsWith("md:falta:")) return;
 
-      const id = interaction.customId || "";
+  // md:falta:<pedido>:<page>:<itemKey>:<messageId>
+  const parts = cid.split(":");
+  const pedido = parts[2];
+  const page = parseInt(parts[3] || "0", 10) || 0;
+
+  const messageId = parts[parts.length - 1];
+  const itemKey = parts.slice(4, parts.length - 1).join(":");
+
+  // ✅ Silencioso: não cria mensagem "Registrado"
+  await interaction.deferUpdate();
+
+  const order = await ensureOrderInCache(pedido);
+  if (!order) return; // sem mensagem no canal
+
+  const obs = String(interaction.fields.getTextInputValue("faltando") || "").trim();
+  const statusFinal = obs ? `FALTA - ${obs}` : "FALTA";
+
+  const who = interaction.user?.username || "usuario";
+  const nowISO = new Date().toISOString();
+
+  await sheetsPost({
+    action: "set_item_status",
+    itemKey: String(itemKey),
+    status: statusFinal,
+    conferidoPor: who,
+    conferidoEmISO: nowISO,
+  });
+
+  const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
+  if (it) it.status = statusFinal;
+
+  orderCache.set(String(order.pedido), order);
+  scheduleSaveCache();
+
+  // edita a mensagem original
+  const channel = interaction.channel;
+  if (channel && channel.isTextBased()) {
+    const msg = await channel.messages.fetch(String(messageId)).catch(() => null);
+    if (msg) {
+      const embed = buildOrderEmbed(order, page);
+      const components = buildOrderComponents(order, page, String(messageId));
+      await msg.edit({ embeds: [embed], components });
+    }
+  }
+
+  return;
+}
+
+    // ===== Buttons =====
+    if (interaction.isButton()) {
+      const id = String(interaction.customId || "");
       const parts = id.split(":");
       const type = parts[0];
 
       if (type === "pg") {
-        const action = parts[1]; // prev | next | tenho_all | falta_all
+        await interaction.deferUpdate();
+
+        const action = parts[1];
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
 
-        const order = orderCache.get(String(pedido));
+        const order = await ensureOrderInCache(pedido);
         if (!order) return;
 
         if (action === "prev" || action === "next") {
           const nextPage = action === "prev" ? page - 1 : page + 1;
           const embed = buildOrderEmbed(order, nextPage);
-          const components = buildOrderComponents(order, nextPage);
+          const components = buildOrderComponents(order, nextPage, String(interaction.message.id));
           return interaction.message.edit({ embeds: [embed], components });
         }
 
@@ -444,52 +589,83 @@ client.on("interactionCreate", async (interaction) => {
             itemKey: String(it.itemKey),
             status,
             conferidoPor: who,
-            conferidoEmISO: nowISO
+            conferidoEmISO: nowISO,
           });
           it.status = status;
         }
 
+        orderCache.set(String(order.pedido), order);
+        scheduleSaveCache();
+
         const embed = buildOrderEmbed(order, page);
-        const components = buildOrderComponents(order, page);
+        const components = buildOrderComponents(order, page, String(interaction.message.id));
         return interaction.message.edit({ embeds: [embed], components });
       }
 
       if (type === "it") {
-        const status = parts[1] === "tenho" ? "TENHO" : "FALTA";
+        const action = parts[1]; // tenho | falta_obs
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
-        const itemKey = parts.slice(4).join(":");
 
-        const order = orderCache.get(String(pedido));
-        if (!order) return;
+        const messageId = parts[parts.length - 1];
+        const itemKey = parts.slice(4, parts.length - 1).join(":");
 
-        const who = interaction.user?.username || "usuario";
-        const nowISO = new Date().toISOString();
+        if (action === "tenho") {
+          await interaction.deferUpdate();
 
-        await sheetsPost({
-          action: "set_item_status",
-          itemKey: String(itemKey),
-          status,
-          conferidoPor: who,
-          conferidoEmISO: nowISO
-        });
+          const order = await ensureOrderInCache(pedido);
+          if (!order) return;
 
-        const it = order.items.find(x => String(x.itemKey) === String(itemKey));
-        if (it) it.status = status;
+          const who = interaction.user?.username || "usuario";
+          const nowISO = new Date().toISOString();
 
-        const embed = buildOrderEmbed(order, page);
-        const components = buildOrderComponents(order, page);
-        return interaction.message.edit({ embeds: [embed], components });
+          await sheetsPost({
+            action: "set_item_status",
+            itemKey: String(itemKey),
+            status: "TENHO",
+            conferidoPor: who,
+            conferidoEmISO: nowISO,
+          });
+
+          const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
+          if (it) it.status = "TENHO";
+
+          orderCache.set(String(order.pedido), order);
+          scheduleSaveCache();
+
+          const embed = buildOrderEmbed(order, page);
+          const components = buildOrderComponents(order, page, String(interaction.message.id));
+          return interaction.message.edit({ embeds: [embed], components });
+        }
+
+        if (action === "falta_obs") {
+          const modal = new ModalBuilder()
+            .setCustomId(`md:falta:${pedido}:${page}:${itemKey}:${messageId}`)
+            .setTitle("O que está faltando?");
+
+          const input = new TextInputBuilder()
+            .setCustomId("faltando")
+            .setLabel("Digite o(s) item(ns) que faltam (opcional)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false)
+            .setMaxLength(200)
+            .setPlaceholder("Ex: faltou Lavanda e Hortelã");
+
+          modal.addComponents(new ActionRowBuilder().addComponents(input));
+          return interaction.showModal(modal);
+        }
       }
     }
   } catch (err) {
     console.error("Interaction error:", err);
+
+    // ✅ Não poluir o canal: sempre reply ephemeral no erro (se der)
     try {
       if (interaction.isRepliable()) {
         if (interaction.deferred) {
-          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
+          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render/PM2.", ephemeral: true });
         } else {
-          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render.", flags: MessageFlags.Ephemeral });
+          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render/PM2.", ephemeral: true });
         }
       }
     } catch (_) {}
