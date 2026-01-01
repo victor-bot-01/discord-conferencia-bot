@@ -1,10 +1,3 @@
-/**
- * index.js (AJUSTADO COMPLETO)
- * Fix principal: evita "DiscordAPIError[10062]: Unknown interaction" no /sync
- * - Lock global para /sync (não roda em paralelo)
- * - DeferReply protegido (se a interaction já expirou, não derruba o processo)
- */
-
 require("dotenv").config();
 
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
@@ -68,10 +61,6 @@ if (!CHANNEL_ID) {
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
-
-// ========== LOCKS GLOBAIS (fix Unknown interaction no /sync) ==========
-let isSyncRunning = false; // 🔒 trava do comando /sync
-// ======================================================================
 
 // ======= Helpers (Sheets API) =======
 async function sheetsGet(action) {
@@ -196,12 +185,14 @@ async function ensureOrderInCache(pedido) {
 }
 
 // ======= UI (Pedido) =======
+// Lista completa; botões paginados
 const PAGE_SIZE = 4;
 
 function extractFaltaObs(statusRaw) {
   const s = String(statusRaw || "").trim();
   const up = s.toUpperCase();
   if (up.startsWith("FALTA -")) {
+    // mantém o texto original depois do primeiro "-"
     const idx = s.indexOf("-");
     const obs = idx >= 0 ? s.slice(idx + 1).trim() : "";
     return obs;
@@ -257,15 +248,14 @@ function buildOrderComponents(order, page = 0, messageIdForButtons = "") {
 
     rows.push(
       new ActionRowBuilder().addComponents(
+        // ✅ AGORA: tenho também leva messageId no final
         new ButtonBuilder()
           .setCustomId(`it:tenho:${order.pedido}:${safePage}:${it.itemKey}:${messageIdForButtons}`)
           .setLabel(`Tenho (Prod ${labelN})`)
           .setStyle(ButtonStyle.Success),
 
         new ButtonBuilder()
-          .setCustomId(
-            `it:falta_obs:${order.pedido}:${safePage}:${it.itemKey}:${messageIdForButtons}`
-          )
+          .setCustomId(`it:falta_obs:${order.pedido}:${safePage}:${it.itemKey}:${messageIdForButtons}`)
           .setLabel(`Falta (Prod ${labelN})`)
           .setStyle(ButtonStyle.Danger)
       )
@@ -315,10 +305,10 @@ async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
   if (GUILD_ID) {
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-    console.log("✅ Commands registrados (guild).");
+    console.log("✅ Commands registered (guild).");
   } else {
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-    console.log("✅ Commands registrados (global).");
+    console.log("✅ Commands registered (global).");
   }
 }
 
@@ -352,6 +342,7 @@ async function autoSyncOnce() {
 
       const embed = buildOrderEmbed(order, 0);
 
+      // envia primeiro, pega messageId
       const msg = await channel.send({ embeds: [embed], components: [] });
 
       const components = buildOrderComponents(order, 0, String(msg.id));
@@ -420,9 +411,7 @@ async function cleanupConfirmedOnce() {
       deletedRows += Number(r.deletedRows || 0);
     }
 
-    console.log(
-      `CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`
-    );
+    console.log(`CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`);
     return { deletedDiscord, deletedRows, total: orders.length };
   } catch (err) {
     console.error("CLEANUP error:", err);
@@ -462,79 +451,37 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "pong ✅", ephemeral: true });
       }
 
-      // ✅ SYNC (COM LOCK + defer protegido)
       if (interaction.commandName === "sync") {
-        if (isSyncRunning) {
-          return interaction.reply({
-            content: "⏳ O sync já está em execução. Aguarde terminar e tente novamente.",
-            ephemeral: true,
+        await interaction.deferReply({ ephemeral: true });
+
+        const data = await sheetsGet("list_pending");
+        const orders = data.orders || [];
+
+        if (!orders.length) {
+          return interaction.editReply("Nada para sincronizar: nenhum pedido PENDENTE sem DiscordMessageId.");
+        }
+
+        let sent = 0;
+        for (const order of orders) {
+          orderCache.set(String(order.pedido), order);
+          scheduleSaveCache();
+
+          const embed = buildOrderEmbed(order, 0);
+          const msg = await interaction.channel.send({ embeds: [embed], components: [] });
+
+          const components = buildOrderComponents(order, 0, String(msg.id));
+          await msg.edit({ embeds: [embed], components });
+
+          await sheetsPost({
+            action: "set_message_id",
+            pedido: String(order.pedido),
+            messageId: String(msg.id),
           });
+
+          sent++;
         }
 
-        isSyncRunning = true;
-        console.log("SYNC: iniciado");
-
-        // tenta defer; se já expirou, não derruba o bot
-        try {
-          await interaction.deferReply({ ephemeral: true });
-        } catch (e) {
-          console.error("SYNC: deferReply falhou (provável interaction expirada):", e?.message || e);
-          isSyncRunning = false;
-          return;
-        }
-
-        try {
-          const data = await sheetsGet("list_pending");
-          const orders = data.orders || [];
-
-          if (!orders.length) {
-            isSyncRunning = false;
-            return interaction.editReply("Nada para sincronizar: nenhum pedido PENDENTE.");
-          }
-
-          // usa sempre o canal fixo (evita confusão de canal)
-          const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-          if (!channel || !channel.isTextBased()) {
-            isSyncRunning = false;
-            return interaction.editReply("❌ Canal configurado inválido (CHANNEL_ID).");
-          }
-
-          let sent = 0;
-
-          for (const order of orders) {
-            orderCache.set(String(order.pedido), order);
-            scheduleSaveCache();
-
-            const embed = buildOrderEmbed(order, 0);
-            const msg = await channel.send({ embeds: [embed], components: [] });
-
-            const components = buildOrderComponents(order, 0, String(msg.id));
-            await msg.edit({ embeds: [embed], components });
-
-            await sheetsPost({
-              action: "set_message_id",
-              pedido: String(order.pedido),
-              messageId: String(msg.id),
-            });
-
-            sent++;
-          }
-
-          isSyncRunning = false;
-          return interaction.editReply(
-            `✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) para o canal configurado.`
-          );
-        } catch (err) {
-          console.error("SYNC error:", err);
-          isSyncRunning = false;
-
-          // tenta responder (se ainda der)
-          try {
-            return interaction.editReply("❌ Erro no sync. Veja logs do Render.");
-          } catch (_) {
-            return;
-          }
-        }
+        return interaction.editReply(`✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) para este canal.`);
       }
 
       if (interaction.commandName === "limpar_confirmados") {
@@ -553,55 +500,57 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     // ===== Modal submit =====
-    if (interaction.isModalSubmit()) {
-      const cid = String(interaction.customId || "");
-      if (!cid.startsWith("md:falta:")) return;
+  if (interaction.isModalSubmit()) {
+  const cid = String(interaction.customId || "");
+  if (!cid.startsWith("md:falta:")) return;
 
-      // md:falta:<pedido>:<page>:<itemKey>:<messageId>
-      const parts = cid.split(":");
-      const pedido = parts[2];
-      const page = parseInt(parts[3] || "0", 10) || 0;
+  // md:falta:<pedido>:<page>:<itemKey>:<messageId>
+  const parts = cid.split(":");
+  const pedido = parts[2];
+  const page = parseInt(parts[3] || "0", 10) || 0;
 
-      const messageId = parts[parts.length - 1];
-      const itemKey = parts.slice(4, parts.length - 1).join(":");
+  const messageId = parts[parts.length - 1];
+  const itemKey = parts.slice(4, parts.length - 1).join(":");
 
-      // Silencioso: não cria mensagem "Registrado"
-      await interaction.deferUpdate();
+  // ✅ Silencioso: não cria mensagem "Registrado"
+  await interaction.deferUpdate();
 
-      const order = await ensureOrderInCache(pedido);
-      if (!order) return;
+  const order = await ensureOrderInCache(pedido);
+  if (!order) return; // sem mensagem no canal
 
-      const obs = String(interaction.fields.getTextInputValue("faltando") || "").trim();
-      const statusFinal = obs ? `FALTA - ${obs}` : "FALTA";
+  const obs = String(interaction.fields.getTextInputValue("faltando") || "").trim();
+  const statusFinal = obs ? `FALTA - ${obs}` : "FALTA";
 
-      const who = interaction.user?.username || "usuario";
-      const nowISO = new Date().toISOString();
+  const who = interaction.user?.username || "usuario";
+  const nowISO = new Date().toISOString();
 
-      await sheetsPost({
-        action: "set_item_status",
-        itemKey: String(itemKey),
-        status: statusFinal,
-        conferidoPor: who,
-        conferidoEmISO: nowISO,
-      });
+  await sheetsPost({
+    action: "set_item_status",
+    itemKey: String(itemKey),
+    status: statusFinal,
+    conferidoPor: who,
+    conferidoEmISO: nowISO,
+  });
 
-      const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
-      if (it) it.status = statusFinal;
+  const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
+  if (it) it.status = statusFinal;
 
-      orderCache.set(String(order.pedido), order);
-      scheduleSaveCache();
+  orderCache.set(String(order.pedido), order);
+  scheduleSaveCache();
 
-      const channel = interaction.channel;
-      if (channel && channel.isTextBased()) {
-        const msg = await channel.messages.fetch(String(messageId)).catch(() => null);
-        if (msg) {
-          const embed = buildOrderEmbed(order, page);
-          const components = buildOrderComponents(order, page, String(messageId));
-          await msg.edit({ embeds: [embed], components });
-        }
-      }
-      return;
+  // edita a mensagem original
+  const channel = interaction.channel;
+  if (channel && channel.isTextBased()) {
+    const msg = await channel.messages.fetch(String(messageId)).catch(() => null);
+    if (msg) {
+      const embed = buildOrderEmbed(order, page);
+      const components = buildOrderComponents(order, page, String(messageId));
+      await msg.edit({ embeds: [embed], components });
     }
+  }
+
+  return;
+}
 
     // ===== Buttons =====
     if (interaction.isButton()) {
@@ -710,19 +659,13 @@ client.on("interactionCreate", async (interaction) => {
   } catch (err) {
     console.error("Interaction error:", err);
 
-    // Não poluir o canal: sempre reply ephemeral no erro (se der)
+    // ✅ Não poluir o canal: sempre reply ephemeral no erro (se der)
     try {
       if (interaction.isRepliable()) {
         if (interaction.deferred) {
-          await interaction.editReply({
-            content: "❌ Erro interno. Veja logs do Render/PM2.",
-            ephemeral: true,
-          });
+          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render/PM2.", ephemeral: true });
         } else {
-          await interaction.reply({
-            content: "❌ Erro interno. Veja logs do Render/PM2.",
-            ephemeral: true,
-          });
+          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render/PM2.", ephemeral: true });
         }
       }
     } catch (_) {}
