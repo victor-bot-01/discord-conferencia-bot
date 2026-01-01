@@ -2,22 +2,9 @@ require("dotenv").config();
 
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
 
-// ===== Render needs an open port for Web Service =====
-const http = require("http");
-const PORT = process.env.PORT || 3000;
-
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("ok");
-  })
-  .listen(PORT, () => {
-    console.log("HTTP server listening on", PORT);
-  });
-// ====================================================
-
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
 
 const {
   Client,
@@ -34,175 +21,218 @@ const {
   TextInputStyle,
 } = require("discord.js");
 
+/* ===================== ENV ===================== */
+
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID;
+const GUILD_ID = process.env.GUILD_ID || null;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-
-const AUTO_SYNC_MINUTES = Number(process.env.AUTO_SYNC_MINUTES || "0");
-const AUTO_CLEANUP_MINUTES = Number(process.env.AUTO_CLEANUP_MINUTES || "0");
 
 const SHEETS_API_URL = process.env.SHEETS_API_URL;
 const SHEETS_API_KEY = process.env.SHEETS_API_KEY;
 
-if (!DISCORD_TOKEN || !CLIENT_ID) process.exit(1);
-if (!SHEETS_API_URL || !SHEETS_API_KEY) process.exit(1);
-if (!CHANNEL_ID) process.exit(1);
+if (!DISCORD_TOKEN || !CLIENT_ID || !CHANNEL_ID || !SHEETS_API_URL || !SHEETS_API_KEY) {
+  console.error("❌ Variáveis de ambiente faltando");
+  process.exit(1);
+}
+
+/* ===================== HTTP (opcional) ===================== */
+
+const PORT = process.env.PORT || 10000;
+http.createServer((_, res) => res.end("ok")).listen(PORT, () => {
+  console.log("HTTP server listening on", PORT);
+});
+
+/* ===================== CLIENT ===================== */
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-// ===== Helpers (Sheets) =====
-async function sheetsGet(action) {
-  const res = await fetch(`${SHEETS_API_URL}?action=${action}&key=${SHEETS_API_KEY}`);
-  const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error("Sheets GET failed");
-  return data;
+/* ===================== HELPERS ===================== */
+
+async function sheetsGet(action, timeoutMs = 15000) {
+  const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(
+    SHEETS_API_KEY
+  )}`;
+
+  console.log(`SHEETS GET → ${action}`);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    const text = await res.text();
+    const data = JSON.parse(text);
+
+    if (!res.ok || !data.ok) {
+      throw new Error(`Sheets erro: ${JSON.stringify(data)}`);
+    }
+
+    return data;
+  } catch (err) {
+    console.error("SHEETS GET ERROR:", err.message);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-async function sheetsPost(payload) {
-  const res = await fetch(SHEETS_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, key: SHEETS_API_KEY }),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error("Sheets POST failed");
-  return data;
+async function sheetsPost(payload, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(SHEETS_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...payload, key: SHEETS_API_KEY }),
+      signal: controller.signal,
+    });
+
+    const text = await res.text();
+    const data = JSON.parse(text);
+
+    if (!res.ok || !data.ok) {
+      throw new Error(`Sheets POST erro: ${JSON.stringify(data)}`);
+    }
+
+    return data;
+  } catch (err) {
+    console.error("SHEETS POST ERROR:", err.message);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-// ===== Cache =====
+/* ===================== CACHE ===================== */
+
 const STATE_FILE = path.join(__dirname, "state.json");
 const orderCache = new Map();
-let saveTimer = null;
 
-function loadCacheFromDisk() {
+function loadCache() {
   if (!fs.existsSync(STATE_FILE)) return;
-  const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  Object.entries(data.orderCache || {}).forEach(([k, v]) => orderCache.set(k, v));
-}
-
-function scheduleSaveCache() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    const obj = {};
-    for (const [k, v] of orderCache) obj[k] = v;
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ orderCache: obj }, null, 2));
-  }, 300);
-}
-
-async function ensureOrderInCache(pedido) {
-  if (orderCache.has(pedido)) return orderCache.get(pedido);
-  const data = await sheetsGet("list_pending");
-  const found = data.orders.find(o => String(o.pedido) === String(pedido));
-  if (found) {
-    orderCache.set(String(pedido), found);
-    scheduleSaveCache();
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    Object.entries(raw.orderCache || {}).forEach(([k, v]) => orderCache.set(k, v));
+    console.log(`CACHE carregado: ${orderCache.size} pedidos`);
+  } catch {
+    console.log("CACHE inválido, ignorado");
   }
-  return found || null;
 }
 
-// ===== UI =====
+function saveCache() {
+  const obj = {};
+  for (const [k, v] of orderCache.entries()) obj[k] = v;
+  fs.writeFileSync(STATE_FILE, JSON.stringify({ orderCache: obj }, null, 2));
+}
+
+/* ===================== UI ===================== */
+
 const PAGE_SIZE = 4;
 
-function extractFaltaObs(s) {
-  const t = String(s || "");
-  return t.toUpperCase().startsWith("FALTA -") ? t.split("-").slice(1).join("-").trim() : "";
-}
-
-function buildOrderEmbed(order, page = 0) {
-  const totalPages = Math.ceil(order.items.length / PAGE_SIZE);
-  const start = page * PAGE_SIZE;
-
+function buildEmbed(order) {
   const lines = order.items.map((it, i) => {
-    const box = it.status?.startsWith("TENHO") ? "🟩" : it.status?.startsWith("FALTA") ? "🟥" : "⬜";
-    const obs = extractFaltaObs(it.status);
-    return `${box} ${i + 1}. ${it.produto}${it.qtd ? ` x${it.qtd}` : ""}${obs ? ` — **${obs}**` : ""}`;
+    const s = (it.status || "").toUpperCase();
+    const box = s.startsWith("TENHO") ? "🟩" : s.startsWith("FALTA") ? "🟥" : "⬜";
+    return `${box} ${i + 1}. ${it.produto}${it.qtd ? ` x${it.qtd}` : ""}`;
   });
 
   return new EmbedBuilder()
     .setTitle("📦 Conferência de Pedido")
     .setDescription(
       `**Pedido:** #${order.pedido}\n` +
-      `**Cliente:** ${order.cliente}\n\n` +
-      lines.join("\n") +
-      `\n\nPágina ${page + 1}/${totalPages}`
+        `**Cliente:** ${order.cliente || "-"}\n\n` +
+        lines.join("\n")
     );
 }
 
-function buildOrderComponents(order, page, messageId) {
-  const rows = [];
-  const start = page * PAGE_SIZE;
-  const slice = order.items.slice(start, start + PAGE_SIZE);
+/* ===================== COMMANDS ===================== */
 
-  for (let i = 0; i < slice.length; i++) {
-    const it = slice[i];
-    rows.push(new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`it:tenho:${order.pedido}:${page}:${it.itemKey}:${messageId}`)
-        .setLabel(`Tenho (${start + i + 1})`)
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId(`it:falta_obs:${order.pedido}:${page}:${it.itemKey}:${messageId}`)
-        .setLabel(`Falta (${start + i + 1})`)
-        .setStyle(ButtonStyle.Danger)
-    ));
-  }
-
-  rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`pg:prev:${order.pedido}:${page}`).setLabel("⬅").setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
-    new ButtonBuilder().setCustomId(`pg:next:${order.pedido}:${page}`).setLabel("➡").setStyle(ButtonStyle.Secondary)
-  ));
-
-  return rows;
-}
-
-// ===== Commands =====
 const commands = [
-  new SlashCommandBuilder().setName("ping").setDescription("Ping"),
+  new SlashCommandBuilder().setName("ping").setDescription("Testa o bot"),
+  new SlashCommandBuilder().setName("sync").setDescription("Sincroniza pedidos pendentes"),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+  if (GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+  } else {
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+  }
+  console.log("✅ Commands registrados");
 }
 
-// ===== Ready =====
+/* ===================== READY ===================== */
+
 client.once("ready", () => {
-  loadCacheFromDisk();
-  console.log("Bot online");
+  console.log(`🤖 Bot online como ${client.user.tag}`);
+  loadCache();
 });
 
-// ===== Interaction Handler (CORRIGIDO) =====
-client.on("interactionCreate", async (interaction) => {
+/* ===================== INTERACTIONS ===================== */
+
+client.on("interactionCreate", async interaction => {
   try {
-    if (interaction.isChatInputCommand()) {
+    if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.commandName === "ping") {
+      return interaction.reply({ content: "pong ✅", ephemeral: true });
+    }
+
+    if (interaction.commandName === "sync") {
+      console.log("SYNC: iniciado");
+
       await interaction.deferReply({ ephemeral: true });
 
-      if (interaction.commandName === "ping") {
-        return interaction.editReply("pong ✅");
+      let data;
+      try {
+        data = await sheetsGet("list_pending");
+      } catch {
+        return interaction.editReply(
+          "❌ A planilha demorou para responder. Tente novamente."
+        );
       }
-    }
 
-    if (interaction.isButton()) {
-      await interaction.deferUpdate();
-      // lógica já existente continua igual
-      return;
-    }
+      const orders = data.orders || [];
+      if (!orders.length) {
+        return interaction.editReply("Nenhum pedido pendente.");
+      }
 
-    if (interaction.isModalSubmit()) {
-      await interaction.deferUpdate();
-      // lógica já existente continua igual
-      return;
+      const channel = await client.channels.fetch(CHANNEL_ID);
+      let sent = 0;
+
+      for (const order of orders) {
+        orderCache.set(String(order.pedido), order);
+        const msg = await channel.send({ embeds: [buildEmbed(order)] });
+
+        await sheetsPost({
+          action: "set_message_id",
+          pedido: String(order.pedido),
+          messageId: String(msg.id),
+        });
+
+        sent++;
+      }
+
+      saveCache();
+      console.log("SYNC: concluído");
+
+      return interaction.editReply(`✅ ${sent} pedido(s) enviados.`);
     }
   } catch (err) {
-    console.error("Interaction error:", err);
+    console.error("INTERACTION ERROR:", err);
+    if (interaction.deferred) {
+      interaction.editReply("❌ Erro interno.");
+    }
   }
 });
 
-// ===== Boot =====
+/* ===================== BOOT ===================== */
+
 (async () => {
   await registerCommands();
   await client.login(DISCORD_TOKEN);
