@@ -1,12 +1,3 @@
-/**
- * index.js (AJUSTADO PARA RENDER / “Unknown interaction”)
- * ✅ Botões: ACK IMEDIATO (deferUpdate) antes de qualquer fetch/planilha
- * ✅ Modal: showModal IMEDIATO (sem deferUpdate antes)
- * ✅ Modal submit: deferUpdate IMEDIATO
- * ✅ Slash: deferReply IMEDIATO (já estava ok)
- * ✅ Fetch em Node: garante global fetch via undici (se necessário)
- */
-
 require("dotenv").config();
 
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
@@ -24,19 +15,6 @@ http
     console.log("HTTP server listening on", PORT);
   });
 // ====================================================
-
-// ===== Ensure fetch exists (Node < 18) =====
-try {
-  if (typeof fetch !== "function") {
-    // eslint-disable-next-line global-require
-    const { fetch: undiciFetch } = require("undici");
-    global.fetch = undiciFetch;
-    console.log("fetch polyfilled via undici");
-  }
-} catch (e) {
-  console.log("WARN: could not polyfill fetch (undici missing). If Node < 18, install undici.");
-}
-// ==========================================
 
 const fs = require("fs");
 const path = require("path");
@@ -207,7 +185,6 @@ async function ensureOrderInCache(pedido) {
 }
 
 // ======= UI (Pedido) =======
-// Lista completa; botões paginados
 const PAGE_SIZE = 4;
 
 function extractFaltaObs(statusRaw) {
@@ -523,16 +500,15 @@ client.on("interactionCreate", async (interaction) => {
       const cid = String(interaction.customId || "");
       if (!cid.startsWith("md:falta:")) return;
 
-      // ✅ ACK IMEDIATO pro Discord não estourar 3s
-      await interaction.deferUpdate();
-
-      // md:falta:<pedido>:<page>:<itemKey>:<messageId>
       const parts = cid.split(":");
       const pedido = parts[2];
       const page = parseInt(parts[3] || "0", 10) || 0;
 
       const messageId = parts[parts.length - 1];
       const itemKey = parts.slice(4, parts.length - 1).join(":");
+
+      // ACK rápido pro modal
+      await interaction.deferUpdate();
 
       const order = await ensureOrderInCache(pedido);
       if (!order) return;
@@ -566,7 +542,6 @@ client.on("interactionCreate", async (interaction) => {
           await msg.edit({ embeds: [embed], components });
         }
       }
-
       return;
     }
 
@@ -576,7 +551,7 @@ client.on("interactionCreate", async (interaction) => {
       const parts = id.split(":");
       const type = parts[0];
 
-      // ✅ 1) Se for abrir MODAL, TEM que ser imediato (sem deferUpdate)
+      // 1) MODAL: não pode defer antes, tem que mostrar modal direto
       if (type === "it" && parts[1] === "falta_obs") {
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
@@ -600,8 +575,18 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // ✅ 2) Todo o resto: ACK IMEDIATO
-      await interaction.deferUpdate();
+      // 2) RESTO: ACK IMEDIATO (resolve Unknown interaction no Render)
+      try {
+        if (!interaction.deferred && !interaction.replied) {
+          await interaction.deferUpdate();
+        }
+      } catch (e) {
+        try {
+          if (!interaction.deferred && !interaction.replied) {
+            await interaction.reply({ content: "⏳ Processando...", ephemeral: true });
+          }
+        } catch (_) {}
+      }
 
       // ===== Agora pode fazer trabalho pesado =====
       if (type === "pg") {
