@@ -1,3 +1,12 @@
+/**
+ * index.js (AJUSTADO PARA RENDER / “Unknown interaction”)
+ * ✅ Botões: ACK IMEDIATO (deferUpdate) antes de qualquer fetch/planilha
+ * ✅ Modal: showModal IMEDIATO (sem deferUpdate antes)
+ * ✅ Modal submit: deferUpdate IMEDIATO
+ * ✅ Slash: deferReply IMEDIATO (já estava ok)
+ * ✅ Fetch em Node: garante global fetch via undici (se necessário)
+ */
+
 require("dotenv").config();
 
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
@@ -15,6 +24,19 @@ http
     console.log("HTTP server listening on", PORT);
   });
 // ====================================================
+
+// ===== Ensure fetch exists (Node < 18) =====
+try {
+  if (typeof fetch !== "function") {
+    // eslint-disable-next-line global-require
+    const { fetch: undiciFetch } = require("undici");
+    global.fetch = undiciFetch;
+    console.log("fetch polyfilled via undici");
+  }
+} catch (e) {
+  console.log("WARN: could not polyfill fetch (undici missing). If Node < 18, install undici.");
+}
+// ==========================================
 
 const fs = require("fs");
 const path = require("path");
@@ -192,7 +214,6 @@ function extractFaltaObs(statusRaw) {
   const s = String(statusRaw || "").trim();
   const up = s.toUpperCase();
   if (up.startsWith("FALTA -")) {
-    // mantém o texto original depois do primeiro "-"
     const idx = s.indexOf("-");
     const obs = idx >= 0 ? s.slice(idx + 1).trim() : "";
     return obs;
@@ -248,7 +269,6 @@ function buildOrderComponents(order, page = 0, messageIdForButtons = "") {
 
     rows.push(
       new ActionRowBuilder().addComponents(
-        // ✅ AGORA: tenho também leva messageId no final
         new ButtonBuilder()
           .setCustomId(`it:tenho:${order.pedido}:${safePage}:${it.itemKey}:${messageIdForButtons}`)
           .setLabel(`Tenho (Prod ${labelN})`)
@@ -342,7 +362,6 @@ async function autoSyncOnce() {
 
       const embed = buildOrderEmbed(order, 0);
 
-      // envia primeiro, pega messageId
       const msg = await channel.send({ embeds: [embed], components: [] });
 
       const components = buildOrderComponents(order, 0, String(msg.id));
@@ -500,57 +519,56 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     // ===== Modal submit =====
-  if (interaction.isModalSubmit()) {
-  const cid = String(interaction.customId || "");
-  if (!cid.startsWith("md:falta:")) return;
+    if (interaction.isModalSubmit()) {
+      const cid = String(interaction.customId || "");
+      if (!cid.startsWith("md:falta:")) return;
 
-  // md:falta:<pedido>:<page>:<itemKey>:<messageId>
-  const parts = cid.split(":");
-  const pedido = parts[2];
-  const page = parseInt(parts[3] || "0", 10) || 0;
+      // ✅ ACK IMEDIATO pro Discord não estourar 3s
+      await interaction.deferUpdate();
 
-  const messageId = parts[parts.length - 1];
-  const itemKey = parts.slice(4, parts.length - 1).join(":");
+      // md:falta:<pedido>:<page>:<itemKey>:<messageId>
+      const parts = cid.split(":");
+      const pedido = parts[2];
+      const page = parseInt(parts[3] || "0", 10) || 0;
 
-  // ✅ Silencioso: não cria mensagem "Registrado"
-  await interaction.deferUpdate();
+      const messageId = parts[parts.length - 1];
+      const itemKey = parts.slice(4, parts.length - 1).join(":");
 
-  const order = await ensureOrderInCache(pedido);
-  if (!order) return; // sem mensagem no canal
+      const order = await ensureOrderInCache(pedido);
+      if (!order) return;
 
-  const obs = String(interaction.fields.getTextInputValue("faltando") || "").trim();
-  const statusFinal = obs ? `FALTA - ${obs}` : "FALTA";
+      const obs = String(interaction.fields.getTextInputValue("faltando") || "").trim();
+      const statusFinal = obs ? `FALTA - ${obs}` : "FALTA";
 
-  const who = interaction.user?.username || "usuario";
-  const nowISO = new Date().toISOString();
+      const who = interaction.user?.username || "usuario";
+      const nowISO = new Date().toISOString();
 
-  await sheetsPost({
-    action: "set_item_status",
-    itemKey: String(itemKey),
-    status: statusFinal,
-    conferidoPor: who,
-    conferidoEmISO: nowISO,
-  });
+      await sheetsPost({
+        action: "set_item_status",
+        itemKey: String(itemKey),
+        status: statusFinal,
+        conferidoPor: who,
+        conferidoEmISO: nowISO,
+      });
 
-  const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
-  if (it) it.status = statusFinal;
+      const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
+      if (it) it.status = statusFinal;
 
-  orderCache.set(String(order.pedido), order);
-  scheduleSaveCache();
+      orderCache.set(String(order.pedido), order);
+      scheduleSaveCache();
 
-  // edita a mensagem original
-  const channel = interaction.channel;
-  if (channel && channel.isTextBased()) {
-    const msg = await channel.messages.fetch(String(messageId)).catch(() => null);
-    if (msg) {
-      const embed = buildOrderEmbed(order, page);
-      const components = buildOrderComponents(order, page, String(messageId));
-      await msg.edit({ embeds: [embed], components });
+      const channel = interaction.channel;
+      if (channel && channel.isTextBased()) {
+        const msg = await channel.messages.fetch(String(messageId)).catch(() => null);
+        if (msg) {
+          const embed = buildOrderEmbed(order, page);
+          const components = buildOrderComponents(order, page, String(messageId));
+          await msg.edit({ embeds: [embed], components });
+        }
+      }
+
+      return;
     }
-  }
-
-  return;
-}
 
     // ===== Buttons =====
     if (interaction.isButton()) {
@@ -558,9 +576,35 @@ client.on("interactionCreate", async (interaction) => {
       const parts = id.split(":");
       const type = parts[0];
 
-      if (type === "pg") {
-        await interaction.deferUpdate();
+      // ✅ 1) Se for abrir MODAL, TEM que ser imediato (sem deferUpdate)
+      if (type === "it" && parts[1] === "falta_obs") {
+        const pedido = parts[2];
+        const page = parseInt(parts[3] || "0", 10) || 0;
 
+        const messageId = parts[parts.length - 1];
+        const itemKey = parts.slice(4, parts.length - 1).join(":");
+
+        const modal = new ModalBuilder()
+          .setCustomId(`md:falta:${pedido}:${page}:${itemKey}:${messageId}`)
+          .setTitle("O que está faltando?");
+
+        const input = new TextInputBuilder()
+          .setCustomId("faltando")
+          .setLabel("Digite o(s) item(ns) que faltam (opcional)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setMaxLength(200)
+          .setPlaceholder("Ex: faltou Lavanda e Hortelã");
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+      }
+
+      // ✅ 2) Todo o resto: ACK IMEDIATO
+      await interaction.deferUpdate();
+
+      // ===== Agora pode fazer trabalho pesado =====
+      if (type === "pg") {
         const action = parts[1];
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
@@ -572,7 +616,8 @@ client.on("interactionCreate", async (interaction) => {
           const nextPage = action === "prev" ? page - 1 : page + 1;
           const embed = buildOrderEmbed(order, nextPage);
           const components = buildOrderComponents(order, nextPage, String(interaction.message.id));
-          return interaction.message.edit({ embeds: [embed], components });
+          await interaction.message.edit({ embeds: [embed], components });
+          return;
         }
 
         const status = action === "tenho_all" ? "TENHO" : "FALTA";
@@ -599,20 +644,18 @@ client.on("interactionCreate", async (interaction) => {
 
         const embed = buildOrderEmbed(order, page);
         const components = buildOrderComponents(order, page, String(interaction.message.id));
-        return interaction.message.edit({ embeds: [embed], components });
+        await interaction.message.edit({ embeds: [embed], components });
+        return;
       }
 
       if (type === "it") {
-        const action = parts[1]; // tenho | falta_obs
+        const action = parts[1]; // tenho
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
 
-        const messageId = parts[parts.length - 1];
         const itemKey = parts.slice(4, parts.length - 1).join(":");
 
         if (action === "tenho") {
-          await interaction.deferUpdate();
-
           const order = await ensureOrderInCache(pedido);
           if (!order) return;
 
@@ -635,37 +678,20 @@ client.on("interactionCreate", async (interaction) => {
 
           const embed = buildOrderEmbed(order, page);
           const components = buildOrderComponents(order, page, String(interaction.message.id));
-          return interaction.message.edit({ embeds: [embed], components });
-        }
-
-        if (action === "falta_obs") {
-          const modal = new ModalBuilder()
-            .setCustomId(`md:falta:${pedido}:${page}:${itemKey}:${messageId}`)
-            .setTitle("O que está faltando?");
-
-          const input = new TextInputBuilder()
-            .setCustomId("faltando")
-            .setLabel("Digite o(s) item(ns) que faltam (opcional)")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(false)
-            .setMaxLength(200)
-            .setPlaceholder("Ex: faltou Lavanda e Hortelã");
-
-          modal.addComponents(new ActionRowBuilder().addComponents(input));
-          return interaction.showModal(modal);
+          await interaction.message.edit({ embeds: [embed], components });
+          return;
         }
       }
     }
   } catch (err) {
     console.error("Interaction error:", err);
 
-    // ✅ Não poluir o canal: sempre reply ephemeral no erro (se der)
     try {
       if (interaction.isRepliable()) {
         if (interaction.deferred) {
-          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render/PM2.", ephemeral: true });
+          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render.", ephemeral: true });
         } else {
-          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render/PM2.", ephemeral: true });
+          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render.", ephemeral: true });
         }
       }
     } catch (_) {}
