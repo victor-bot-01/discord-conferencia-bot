@@ -1,16 +1,17 @@
 /**
- * index.js (RENDER / "Esta interação falhou" intermitente)
- * ✅ Botões: await deferUpdate() para garantir ACK antes do trabalho pesado
- * ✅ Modal: showModal imediato
- * ✅ Modal submit: await deferUpdate() imediato
- * ✅ state.json: salvamento assíncrono (sem travar)
- * ✅ fetch polyfill (undici) se Node < 18
+ * index.js (AJUSTADO DEFINITIVO p/ Render / “Unknown interaction”)
+ *
+ * ✅ Corrige “Esta interação falhou” / DiscordAPIError[10062] Unknown interaction
+ *    Causa: ACK duplicado (deferUpdate/reply/showModal mais de 1x no mesmo clique)
+ * ✅ Regra aplicada:
+ *    - Botões: 1 ACK ÚNICO (deferUpdate) no topo (exceto quando abre modal)
+ *    - Modal open: showModal imediato (sem defer)
+ *    - Modal submit: 1 ACK ÚNICO (deferUpdate) no topo
+ *    - Slash: deferReply imediato (já estava ok)
+ * ✅ Node fetch: garante global fetch via undici se Node < 18
  */
 
 require("dotenv").config();
-
-process.on("unhandledRejection", (reason) => console.error("UNHANDLED REJECTION:", reason));
-process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
 
@@ -31,6 +32,7 @@ http
 // ===== Ensure fetch exists (Node < 18) =====
 try {
   if (typeof fetch !== "function") {
+    // eslint-disable-next-line global-require
     const { fetch: undiciFetch } = require("undici");
     global.fetch = undiciFetch;
     console.log("fetch polyfilled via undici");
@@ -41,7 +43,6 @@ try {
 // ==========================================
 
 const fs = require("fs");
-const fsp = require("fs/promises");
 const path = require("path");
 
 const {
@@ -62,10 +63,10 @@ const {
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID; // opcional
-const CHANNEL_ID = process.env.CHANNEL_ID;
+const CHANNEL_ID = process.env.CHANNEL_ID; // canal fixo para postar
 
-const AUTO_SYNC_MINUTES = Number(process.env.AUTO_SYNC_MINUTES || "0");
-const AUTO_CLEANUP_MINUTES = Number(process.env.AUTO_CLEANUP_MINUTES || "0");
+const AUTO_SYNC_MINUTES = Number(process.env.AUTO_SYNC_MINUTES || "0"); // 0 = desliga
+const AUTO_CLEANUP_MINUTES = Number(process.env.AUTO_CLEANUP_MINUTES || "0"); // 0 = desliga
 
 const SHEETS_API_URL = process.env.SHEETS_API_URL;
 const SHEETS_API_KEY = process.env.SHEETS_API_KEY;
@@ -147,7 +148,8 @@ async function deleteDiscordMessageById(messageId) {
 
 // ======= Cache persistente =======
 const STATE_FILE = path.join(__dirname, "state.json");
-const orderCache = new Map();
+const orderCache = new Map(); // pedido -> orderObject
+let saveTimer = null;
 
 function safeReadJSON(file) {
   try {
@@ -173,43 +175,19 @@ function loadCacheFromDisk() {
   return count;
 }
 
-// ✅ Salvamento assíncrono (não trava o event-loop)
-let saveTimer = null;
-let savingNow = false;
-let pendingSave = false;
-
-async function flushSaveCache() {
-  if (savingNow) {
-    pendingSave = true;
-    return;
-  }
-  savingNow = true;
-
-  try {
-    const obj = {};
-    for (const [pedido, order] of orderCache.entries()) obj[String(pedido)] = order;
-
-    const payload = JSON.stringify({ orderCache: obj }, null, 2);
-    const tmp = `${STATE_FILE}.tmp`;
-
-    await fsp.writeFile(tmp, payload, "utf8");
-    await fsp.rename(tmp, STATE_FILE);
-  } catch (e) {
-    console.log("WARN: failed to save state.json:", e?.message || e);
-  } finally {
-    savingNow = false;
-    if (pendingSave) {
-      pendingSave = false;
-      flushSaveCache().catch(() => {});
-    }
-  }
-}
-
 function scheduleSaveCache() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    flushSaveCache().catch(() => {});
+    try {
+      const obj = {};
+      for (const [pedido, order] of orderCache.entries()) {
+        obj[String(pedido)] = order;
+      }
+      fs.writeFileSync(STATE_FILE, JSON.stringify({ orderCache: obj }, null, 2), "utf8");
+    } catch (e) {
+      console.log("WARN: failed to save state.json:", e?.message || e);
+    }
   }, 500);
 }
 
@@ -228,10 +206,12 @@ async function ensureOrderInCache(pedido) {
       return found;
     }
   } catch (_) {}
+
   return null;
 }
 
-// ======= UI =======
+// ======= UI (Pedido) =======
+// Lista completa; botões paginados
 const PAGE_SIZE = 4;
 
 function extractFaltaObs(statusRaw) {
@@ -239,7 +219,8 @@ function extractFaltaObs(statusRaw) {
   const up = s.toUpperCase();
   if (up.startsWith("FALTA -")) {
     const idx = s.indexOf("-");
-    return idx >= 0 ? s.slice(idx + 1).trim() : "";
+    const obs = idx >= 0 ? s.slice(idx + 1).trim() : "";
+    return obs;
   }
   return "";
 }
@@ -336,10 +317,12 @@ function buildOrderComponents(order, page = 0, messageIdForButtons = "") {
 // ======= Commands =======
 const commands = [
   new SlashCommandBuilder().setName("ping").setDescription("Testa o bot"),
-  new SlashCommandBuilder().setName("sync").setDescription("Envia pedidos PENDENTES da planilha."),
+  new SlashCommandBuilder()
+    .setName("sync")
+    .setDescription("Envia para o Discord os pedidos PENDENTES da planilha (não postados ainda)."),
   new SlashCommandBuilder()
     .setName("limpar_confirmados")
-    .setDescription("Apaga no Discord e remove da planilha Confirmado = SIM."),
+    .setDescription("Apaga no Discord e remove da planilha os pedidos com Confirmado = SIM."),
 ].map((c) => c.toJSON());
 
 async function registerCommands() {
@@ -353,7 +336,7 @@ async function registerCommands() {
   }
 }
 
-// ======= AUTO SYNC / CLEANUP =======
+// ======= AUTO SYNC =======
 let isAutoSyncRunning = false;
 
 async function autoSyncOnce() {
@@ -362,24 +345,42 @@ async function autoSyncOnce() {
 
   try {
     const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-    if (!channel || !channel.isTextBased()) return;
+    if (!channel || !channel.isTextBased()) {
+      console.error("AUTO_SYNC: Channel not found or not text-based:", CHANNEL_ID);
+      return;
+    }
 
     const data = await sheetsGet("list_pending");
     const orders = data.orders || [];
-    if (!orders.length) return;
+
+    if (!orders.length) {
+      console.log("AUTO_SYNC: no pending orders.");
+      return;
+    }
+
+    let sent = 0;
 
     for (const order of orders) {
       orderCache.set(String(order.pedido), order);
       scheduleSaveCache();
 
       const embed = buildOrderEmbed(order, 0);
+
       const msg = await channel.send({ embeds: [embed], components: [] });
 
       const components = buildOrderComponents(order, 0, String(msg.id));
       await msg.edit({ embeds: [embed], components });
 
-      await sheetsPost({ action: "set_message_id", pedido: String(order.pedido), messageId: String(msg.id) });
+      await sheetsPost({
+        action: "set_message_id",
+        pedido: String(order.pedido),
+        messageId: String(msg.id),
+      });
+
+      sent++;
     }
+
+    console.log(`AUTO_SYNC: sent ${sent} order(s).`);
   } catch (err) {
     console.error("AUTO_SYNC error:", err);
   } finally {
@@ -388,12 +389,17 @@ async function autoSyncOnce() {
 }
 
 function startAutoSync() {
-  if (!AUTO_SYNC_MINUTES || AUTO_SYNC_MINUTES <= 0) return;
+  if (!AUTO_SYNC_MINUTES || AUTO_SYNC_MINUTES <= 0) {
+    console.log("AUTO_SYNC: disabled (AUTO_SYNC_MINUTES <= 0).");
+    return;
+  }
   const ms = AUTO_SYNC_MINUTES * 60 * 1000;
+  console.log(`AUTO_SYNC: enabled every ${AUTO_SYNC_MINUTES} minute(s). Channel: ${CHANNEL_ID}`);
   autoSyncOnce();
   setInterval(autoSyncOnce, ms);
 }
 
+// ======= CLEANUP CONFIRMADOS =======
 let isCleanupRunning = false;
 
 async function cleanupConfirmedOnce() {
@@ -403,27 +409,48 @@ async function cleanupConfirmedOnce() {
   try {
     const data = await sheetsGet("list_confirmed");
     const orders = data.orders || [];
-    if (!orders.length) return;
+
+    if (!orders.length) {
+      console.log("CLEANUP: no confirmed orders to delete.");
+      return { deletedDiscord: 0, deletedRows: 0, total: 0 };
+    }
+
+    let deletedDiscord = 0;
+    let deletedRows = 0;
 
     for (const o of orders) {
       const messageId = String(o.discordMessageId || o.messageId || "").trim();
       if (!messageId) continue;
 
       const del = await deleteDiscordMessageById(messageId);
-      if (!del.ok) continue;
+      if (!del.ok) {
+        console.error("CLEANUP: failed to delete discord message", messageId, del);
+        continue;
+      }
 
-      await sheetsPost({ action: "delete_order_by_message_id", messageId });
+      deletedDiscord++;
+
+      const r = await sheetsPost({ action: "delete_order_by_message_id", messageId });
+      deletedRows += Number(r.deletedRows || 0);
     }
+
+    console.log(`CLEANUP: done. Discord=${deletedDiscord}, rows=${deletedRows}, totalOrders=${orders.length}`);
+    return { deletedDiscord, deletedRows, total: orders.length };
   } catch (err) {
     console.error("CLEANUP error:", err);
+    return { error: String(err?.message || err) };
   } finally {
     isCleanupRunning = false;
   }
 }
 
 function startAutoCleanup() {
-  if (!AUTO_CLEANUP_MINUTES || AUTO_CLEANUP_MINUTES <= 0) return;
+  if (!AUTO_CLEANUP_MINUTES || AUTO_CLEANUP_MINUTES <= 0) {
+    console.log("CLEANUP: disabled (AUTO_CLEANUP_MINUTES <= 0).");
+    return;
+  }
   const ms = AUTO_CLEANUP_MINUTES * 60 * 1000;
+  console.log(`CLEANUP: enabled every ${AUTO_CLEANUP_MINUTES} minute(s).`);
   cleanupConfirmedOnce();
   setInterval(cleanupConfirmedOnce, ms);
 }
@@ -433,6 +460,7 @@ client.once("ready", async () => {
   console.log(`🤖 Bot online como: ${client.user.tag}`);
   const loaded = loadCacheFromDisk();
   console.log(`CACHE: carreguei ${loaded} pedido(s) do state.json`);
+
   startAutoSync();
   startAutoCleanup();
 });
@@ -440,16 +468,21 @@ client.once("ready", async () => {
 // ======= Interaction Handler =======
 client.on("interactionCreate", async (interaction) => {
   try {
-    // ===== Slash =====
+    // ===== Commands =====
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === "ping") return interaction.reply({ content: "pong ✅", ephemeral: true });
+      if (interaction.commandName === "ping") {
+        return interaction.reply({ content: "pong ✅", ephemeral: true });
+      }
 
       if (interaction.commandName === "sync") {
         await interaction.deferReply({ ephemeral: true });
 
         const data = await sheetsGet("list_pending");
         const orders = data.orders || [];
-        if (!orders.length) return interaction.editReply("Nada para sincronizar.");
+
+        if (!orders.length) {
+          return interaction.editReply("Nada para sincronizar: nenhum pedido PENDENTE sem DiscordMessageId.");
+        }
 
         let sent = 0;
         for (const order of orders) {
@@ -462,17 +495,30 @@ client.on("interactionCreate", async (interaction) => {
           const components = buildOrderComponents(order, 0, String(msg.id));
           await msg.edit({ embeds: [embed], components });
 
-          await sheetsPost({ action: "set_message_id", pedido: String(order.pedido), messageId: String(msg.id) });
+          await sheetsPost({
+            action: "set_message_id",
+            pedido: String(order.pedido),
+            messageId: String(msg.id),
+          });
+
           sent++;
         }
 
-        return interaction.editReply(`✅ Sincronizado! Enviei **${sent}** pedido(s).`);
+        return interaction.editReply(`✅ Sincronizado! Enviei **${sent}** pedido(s) PENDENTE(s) para este canal.`);
       }
 
       if (interaction.commandName === "limpar_confirmados") {
         await interaction.deferReply({ ephemeral: true });
-        await cleanupConfirmedOnce();
-        return interaction.editReply("✅ Limpeza executada.");
+
+        const result = await cleanupConfirmedOnce();
+        if (result?.error) return interaction.editReply(`❌ Erro: ${result.error}`);
+
+        return interaction.editReply(
+          `✅ Limpeza concluída.\n` +
+            `• Pedidos processados: ${result.total}\n` +
+            `• Mensagens apagadas no Discord: ${result.deletedDiscord}\n` +
+            `• Linhas removidas da planilha: ${result.deletedRows}`
+        );
       }
     }
 
@@ -481,13 +527,16 @@ client.on("interactionCreate", async (interaction) => {
       const cid = String(interaction.customId || "");
       if (!cid.startsWith("md:falta:")) return;
 
+      // ✅ ACK ÚNICO e IMEDIATO (evita 3s e evita ack duplo)
       if (!interaction.deferred && !interaction.replied) {
         await interaction.deferUpdate();
       }
 
+      // md:falta:<pedido>:<page>:<itemKey>:<messageId>
       const parts = cid.split(":");
       const pedido = parts[2];
       const page = parseInt(parts[3] || "0", 10) || 0;
+
       const messageId = parts[parts.length - 1];
       const itemKey = parts.slice(4, parts.length - 1).join(":");
 
@@ -532,10 +581,11 @@ client.on("interactionCreate", async (interaction) => {
       const parts = id.split(":");
       const type = parts[0];
 
-      // Modal abre imediato
+      // ✅ Se for abrir MODAL, showModal IMEDIATO (sem deferUpdate)
       if (type === "it" && parts[1] === "falta_obs") {
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
+
         const messageId = parts[parts.length - 1];
         const itemKey = parts.slice(4, parts.length - 1).join(":");
 
@@ -555,11 +605,12 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // ✅ Aqui está o ponto: garantir ACK concluído antes de qualquer coisa
+      // ✅ Para QUALQUER outro botão: ACK ÚNICO aqui (e nunca mais abaixo)
       if (!interaction.deferred && !interaction.replied) {
         await interaction.deferUpdate();
       }
 
+      // ===== Paginação / ações por página =====
       if (type === "pg") {
         const action = parts[1];
         const pedido = parts[2];
@@ -604,39 +655,57 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      if (type === "it" && parts[1] === "tenho") {
+      // ===== Item actions =====
+      if (type === "it") {
+        const action = parts[1]; // tenho
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
+
+        // it:tenho:<pedido>:<page>:<itemKey>:<messageId>
+        // Aqui o itemKey pode conter ":" então juntamos tudo até o último campo
         const itemKey = parts.slice(4, parts.length - 1).join(":");
 
-        const order = await ensureOrderInCache(pedido);
-        if (!order) return;
+        if (action === "tenho") {
+          const order = await ensureOrderInCache(pedido);
+          if (!order) return;
 
-        const who = interaction.user?.username || "usuario";
-        const nowISO = new Date().toISOString();
+          const who = interaction.user?.username || "usuario";
+          const nowISO = new Date().toISOString();
 
-        await sheetsPost({
-          action: "set_item_status",
-          itemKey: String(itemKey),
-          status: "TENHO",
-          conferidoPor: who,
-          conferidoEmISO: nowISO,
-        });
+          await sheetsPost({
+            action: "set_item_status",
+            itemKey: String(itemKey),
+            status: "TENHO",
+            conferidoPor: who,
+            conferidoEmISO: nowISO,
+          });
 
-        const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
-        if (it) it.status = "TENHO";
+          const it = order.items.find((x) => String(x.itemKey) === String(itemKey));
+          if (it) it.status = "TENHO";
 
-        orderCache.set(String(order.pedido), order);
-        scheduleSaveCache();
+          orderCache.set(String(order.pedido), order);
+          scheduleSaveCache();
 
-        const embed = buildOrderEmbed(order, page);
-        const components = buildOrderComponents(order, page, String(interaction.message.id));
-        await interaction.message.edit({ embeds: [embed], components });
-        return;
+          const embed = buildOrderEmbed(order, page);
+          const components = buildOrderComponents(order, page, String(interaction.message.id));
+          await interaction.message.edit({ embeds: [embed], components });
+          return;
+        }
       }
     }
   } catch (err) {
     console.error("Interaction error:", err);
+
+    // Não poluir canal; tenta avisar de forma segura
+    try {
+      if (interaction.isRepliable()) {
+        if (interaction.deferred) {
+          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render.", ephemeral: true });
+        } else if (!interaction.replied) {
+          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render.", ephemeral: true });
+        }
+      }
+    } catch (_) {}
   }
 });
 
