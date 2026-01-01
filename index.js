@@ -1,4 +1,21 @@
+/**
+ * index.js (AJUSTADO PARA RENDER / “Unknown interaction”)
+ * ✅ Botões: ACK IMEDIATO (deferUpdate) antes de qualquer fetch/planilha
+ * ✅ Modal: showModal IMEDIATO (sem deferUpdate antes)
+ * ✅ Modal submit: deferUpdate IMEDIATO
+ * ✅ Slash: deferReply IMEDIATO
+ * ✅ Fetch em Node: garante global fetch via undici (se necessário)
+ * ✅ IMPORTANTE: salvar state.json SEM BLOQUEAR event-loop (fs.promises.writeFile)
+ */
+
 require("dotenv").config();
+
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
 
 console.log("ENV CHECK:", !!process.env.DISCORD_TOKEN, !!process.env.CLIENT_ID);
 
@@ -16,7 +33,20 @@ http
   });
 // ====================================================
 
+// ===== Ensure fetch exists (Node < 18) =====
+try {
+  if (typeof fetch !== "function") {
+    const { fetch: undiciFetch } = require("undici");
+    global.fetch = undiciFetch;
+    console.log("fetch polyfilled via undici");
+  }
+} catch (e) {
+  console.log("WARN: could not polyfill fetch (undici missing). If Node < 18, install undici.");
+}
+// ==========================================
+
 const fs = require("fs");
+const fsp = require("fs/promises");
 const path = require("path");
 
 const {
@@ -67,6 +97,7 @@ async function sheetsGet(action) {
   const url = `${SHEETS_API_URL}?action=${encodeURIComponent(action)}&key=${encodeURIComponent(
     SHEETS_API_KEY
   )}`;
+
   const res = await fetch(url, { method: "GET" });
 
   const text = await res.text();
@@ -123,7 +154,6 @@ async function deleteDiscordMessageById(messageId) {
 // ======= Cache persistente =======
 const STATE_FILE = path.join(__dirname, "state.json");
 const orderCache = new Map(); // pedido -> orderObject
-let saveTimer = null;
 
 function safeReadJSON(file) {
   try {
@@ -149,19 +179,50 @@ function loadCacheFromDisk() {
   return count;
 }
 
+/**
+ * ✅ NOVO: Salvamento não-bloqueante
+ * Evita travar o event-loop (causa típica do "A interação falhou" no Render).
+ */
+let saveTimer = null;
+let savingNow = false;
+let pendingSave = false;
+
+async function flushSaveCache() {
+  if (savingNow) {
+    pendingSave = true;
+    return;
+  }
+  savingNow = true;
+
+  try {
+    const obj = {};
+    for (const [pedido, order] of orderCache.entries()) {
+      obj[String(pedido)] = order;
+    }
+
+    const payload = JSON.stringify({ orderCache: obj }, null, 2);
+
+    // write atomically (temp -> rename) reduz risco de arquivo corromper
+    const tmp = `${STATE_FILE}.tmp`;
+    await fsp.writeFile(tmp, payload, "utf8");
+    await fsp.rename(tmp, STATE_FILE);
+  } catch (e) {
+    console.log("WARN: failed to save state.json:", e?.message || e);
+  } finally {
+    savingNow = false;
+    if (pendingSave) {
+      pendingSave = false;
+      // roda mais uma vez se teve mudanças durante o save
+      flushSaveCache().catch(() => {});
+    }
+  }
+}
+
 function scheduleSaveCache() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    try {
-      const obj = {};
-      for (const [pedido, order] of orderCache.entries()) {
-        obj[String(pedido)] = order;
-      }
-      fs.writeFileSync(STATE_FILE, JSON.stringify({ orderCache: obj }, null, 2), "utf8");
-    } catch (e) {
-      console.log("WARN: failed to save state.json:", e?.message || e);
-    }
+    flushSaveCache().catch(() => {});
   }, 500);
 }
 
@@ -500,15 +561,15 @@ client.on("interactionCreate", async (interaction) => {
       const cid = String(interaction.customId || "");
       if (!cid.startsWith("md:falta:")) return;
 
+      // ACK imediato
+      interaction.deferUpdate().catch(() => {});
+
       const parts = cid.split(":");
       const pedido = parts[2];
       const page = parseInt(parts[3] || "0", 10) || 0;
 
       const messageId = parts[parts.length - 1];
       const itemKey = parts.slice(4, parts.length - 1).join(":");
-
-      // ACK rápido pro modal
-      await interaction.deferUpdate();
 
       const order = await ensureOrderInCache(pedido);
       if (!order) return;
@@ -551,7 +612,7 @@ client.on("interactionCreate", async (interaction) => {
       const parts = id.split(":");
       const type = parts[0];
 
-      // 1) MODAL: não pode defer antes, tem que mostrar modal direto
+      // Modal: precisa ser imediato
       if (type === "it" && parts[1] === "falta_obs") {
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
@@ -575,20 +636,9 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // 2) RESTO: ACK IMEDIATO (resolve Unknown interaction no Render)
-      try {
-        if (!interaction.deferred && !interaction.replied) {
-          await interaction.deferUpdate();
-        }
-      } catch (e) {
-        try {
-          if (!interaction.deferred && !interaction.replied) {
-            await interaction.reply({ content: "⏳ Processando...", ephemeral: true });
-          }
-        } catch (_) {}
-      }
+      // ✅ ACK "fire-and-forget" (não espere a promise)
+      interaction.deferUpdate().catch(() => {});
 
-      // ===== Agora pode fazer trabalho pesado =====
       if (type === "pg") {
         const action = parts[1];
         const pedido = parts[2];
@@ -634,7 +684,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (type === "it") {
-        const action = parts[1]; // tenho
+        const action = parts[1];
         const pedido = parts[2];
         const page = parseInt(parts[3] || "0", 10) || 0;
 
@@ -670,16 +720,7 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (err) {
     console.error("Interaction error:", err);
-
-    try {
-      if (interaction.isRepliable()) {
-        if (interaction.deferred) {
-          await interaction.editReply({ content: "❌ Erro interno. Veja logs do Render.", ephemeral: true });
-        } else {
-          await interaction.reply({ content: "❌ Erro interno. Veja logs do Render.", ephemeral: true });
-        }
-      }
-    } catch (_) {}
+    // Evita tentar reply/editReply em botão (não faz sentido e só gera erro)
   }
 });
 
